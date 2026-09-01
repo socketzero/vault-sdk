@@ -384,9 +384,12 @@ export function readBundle(buffer: Uint8Array | ArrayBuffer): BundleView {
   const grup = requiredSection(sections, "GRUP");
   const filt = requiredSection(sections, "FILT");
 
-  assertSectionHolds(conn, CONN_RECORD_BYTES, "CONN");
+  // CONN and FILT are pure arrays of fixed-width records, so their length is
+  // exactly count * width and anything else is a lie about one of the two.
+  assertSectionExact(conn, CONN_RECORD_BYTES, "CONN");
+  assertSectionExact(filt, FILT_ENTRY_BYTES, "FILT");
+  // GRUP carries its buckets after the records, so it can only be bounded.
   assertSectionHolds(grup, GRUP_RECORD_BYTES, "GRUP");
-  assertSectionHolds(filt, FILT_ENTRY_BYTES, "FILT");
 
   const slots = indexSlots(indx);
   const connectionCount = conn.count;
@@ -937,6 +940,33 @@ function requiredSection(sections: Map<number, SectionEntry>, kind: SectionKindN
  * every walk below is driven by `count`. Left unchecked, a count larger than
  * the section reads the section that follows it as records of this one's shape.
  */
+/**
+ * A fixed-width section's record count and its byte length must agree exactly.
+ *
+ * The obvious check is one-sided — "the records fit in the bytes" — and that is
+ * not enough. `count` is what the seal audit and `connectionCount` iterate,
+ * while `lookup` reaches a record through the index and bounds it by `length`.
+ * A `count` *lower* than the bytes allow therefore satisfies a `<=` check while
+ * hiding records from every audit that walks the section and leaving them fully
+ * reachable through the index: an attacker who can write to the store puts a
+ * pre-opened record past `count`, and it reads back as chosen plaintext.
+ *
+ * Requiring equality removes the gap rather than patching one of its exits. It
+ * costs nothing: the writer computes both numbers from the same record list.
+ */
+function assertSectionExact(entry: SectionEntry, recordBytes: number, kind: string): void {
+  if (entry.count * recordBytes !== entry.length) {
+    throw new BundleFormatError(
+      `section ${kind} claims ${entry.count} records but holds ${entry.length} bytes, ` +
+        `which is not ${entry.count} * ${recordBytes}`,
+    );
+  }
+}
+
+/**
+ * A section whose records are followed by variable-width data — GRUP, whose
+ * buckets are nested after the fixed records — can only be bounded, not pinned.
+ */
 function assertSectionHolds(entry: SectionEntry, recordBytes: number, kind: string): void {
   if (entry.count * recordBytes > entry.length) {
     throw new BundleFormatError(
@@ -968,7 +998,14 @@ function assertEntirelySealed(
   conn: SectionEntry,
   grup: SectionEntry,
 ): void {
-  for (let index = 0; index < conn.count; index += 1) {
+  // Every record the *bytes* can hold, not every record the count admits to.
+  // `lookup` reaches a record through the index and bounds it by the section's
+  // length, so auditing by `count` would leave anything past it unaudited and
+  // still reachable. `assertSectionExact` already makes these equal for a
+  // well-formed bundle; deriving the bound from the length as well means this
+  // audit does not depend on that check having run.
+  const addressable = Math.floor(conn.length / CONN_RECORD_BYTES);
+  for (let index = 0; index < addressable; index += 1) {
     const recordOffset = connRecordOffset(conn.offset, index);
     const fieldCount = view.getUint32(recordOffset + CONN_OFFSET.FIELD_COUNT, true);
     if (fieldCount > CONN_MAX_FIELDS) {

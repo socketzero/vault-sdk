@@ -15,7 +15,8 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "bin"
   ],
   "engines": {
     "node": ">=22"
@@ -36,5 +37,8 @@
     "@vitest/coverage-v8": "4.1.11",
     "typescript": "7.0.2",
     "vitest": "4.1.11"
+  },
+  "bin": {
+    "s0bundle": "./bin/s0bundle.js"
   }
 }

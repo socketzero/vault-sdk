@@ -8,7 +8,7 @@ export default defineConfig({
       provider: "v8",
       reporter: ["text", "lcov"],
       include: ["src/**"],
-      exclude: ["src/**/*.test.ts", "src/index.ts"],
+      exclude: ["src/**/*.test.ts", "src/**/*.fixture.ts", "src/index.ts"],
       // The catalog calls a silent crypto defect the worst failure mode in the
       // system, so nothing in src/ ships uncovered.
       thresholds: {

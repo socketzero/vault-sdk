@@ -121,6 +121,39 @@ export {
 } from "./envelope.js";
 // --- key groups and buckets ------------------------------------------------
 export { buildBucket, findBucketEntry, WRAPPED_PRIVATE_KEY_BYTES } from "./group.js";
+export type {
+  BucketEntryDump,
+  BundleDump,
+  BundleStats,
+  ConnectionDump,
+  FieldDump,
+  FilterDump,
+  GroupDump,
+  HeaderDump,
+  InspectOptions,
+  SectionDump,
+  VerifyReport,
+} from "./inspect.js";
+// --- inspection: the bundle as JSON ----------------------------------------
+//
+// `datamodel/bundle` names a third party beside the writer and the shard —
+// tooling that loads a generation to look at it. `inspectBundle` is that party,
+// and it cannot decrypt: a sealed field renders as its envelope and its length,
+// and plaintext appears only when a caller hands in a `revealed` map it
+// computed itself. `bundleFromJSON` is the inverse, and a whole dump rebuilds
+// byte-for-byte, which is what makes a dump usable as a golden vector.
+export {
+  BUNDLE_CAP_BYTES,
+  BundleDumpError,
+  bundleFromJSON,
+  DUMP_FORMAT,
+  DUMP_FORMAT_VERSION,
+  inspectBundle,
+  RECORD_BYTES,
+  revealKey,
+  SECTION_KINDS,
+  verifyBundle,
+} from "./inspect.js";
 // --- branded key material: the only way to make a key out of bytes ---------
 //
 // A public half, a private half and an API key are all 32 raw bytes and all
