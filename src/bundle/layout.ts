@@ -19,7 +19,7 @@
  *     +-----------------------------------------------------------------+
  */
 
-import type { SectionKindName } from "../types.js";
+import { BundleCapacityError, BundleFormatError, type SectionKindName } from "../types.js";
 
 // ---------------------------------------------------------------------------
 // Header
@@ -105,6 +105,12 @@ export const INDEX_SLOT_OFFSET = {
 export const INDEX_EMPTY_SLOT = 0;
 /** `2^k >= 4 x connection_count`, so the load factor stays at or below 0.25. */
 export const INDEX_MIN_SLOTS_PER_CONNECTION = 4;
+/**
+ * The floor, so that an empty or single-connection shard still has a table to
+ * mask into. `slots - 1` must be a usable mask, and a one-slot table would make
+ * every id collide with every other as soon as a second connection arrived.
+ */
+export const INDEX_MIN_SLOTS = 8;
 /** A full shard: 262,144 slots, 2 MiB, roughly 51,000 connections. */
 export const INDEX_MAX_SLOTS = 262144;
 /** The connection id's UUID part is sixteen bytes; all sixteen are verified on a hit. */
@@ -202,10 +208,64 @@ export const FILT_ENTRY_OFFSET = {
 // Offset arithmetic
 // ---------------------------------------------------------------------------
 
+/**
+ * A power of two has exactly one bit set, and `n & (n - 1)` clears that bit.
+ * The integer and range checks come first because `&` silently truncates to
+ * int32: without them `8.5` and `2 ** 32 + 8` would both answer yes.
+ */
+function isPowerOfTwo(value: number): boolean {
+  return (
+    Number.isInteger(value) && value > 0 && value <= MAX_POWER_OF_TWO && (value & (value - 1)) === 0
+  );
+}
+
+/** The largest power of two that survives a bitwise `&` as a positive int32. */
+const MAX_POWER_OF_TWO = 0x40000000;
+
+/** Section kinds are four ASCII characters read as a uint32; nothing else fits. */
+function assertUint32(name: string, value: number): void {
+  if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+    throw new BundleFormatError(`${name} must be a uint32, got ${value}`);
+  }
+}
+
+/**
+ * Reading four big-endian bytes through a `DataView` rather than by indexing.
+ * Indexing a `Uint8Array` under `noUncheckedIndexedAccess` yields `number |
+ * undefined` and would need a coalesce per byte — a branch that can never be
+ * taken once the length is checked, which is worse than one view.
+ */
+function readUint32BE(bytes: Uint8Array, byteOffset: number): number {
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(
+    byteOffset,
+    false,
+  );
+}
+
+function assertUuidBytes(id: Uint8Array): void {
+  if (id.byteLength !== CONNECTION_ID_BYTES) {
+    throw new BundleFormatError(
+      `a connection id is ${CONNECTION_ID_BYTES} bytes, got ${id.byteLength}`,
+    );
+  }
+}
+
 /** The smallest power of two that is at least `4 x connectionCount`, minimum 8. */
 export function indexSlotCount(connectionCount: number): number {
-  void connectionCount;
-  throw new Error("not implemented");
+  if (!Number.isInteger(connectionCount) || connectionCount < 0) {
+    throw new BundleFormatError(
+      `connection count must be a non-negative integer, got ${connectionCount}`,
+    );
+  }
+  const required = Math.max(connectionCount * INDEX_MIN_SLOTS_PER_CONNECTION, INDEX_MIN_SLOTS);
+  // Checked before rounding up, so the shift below can never overflow int32.
+  if (required > INDEX_MAX_SLOTS) {
+    throw new BundleCapacityError(
+      `${connectionCount} connections need more than the ${INDEX_MAX_SLOTS} index slots a shard has`,
+    );
+  }
+  // `required >= 8`, so `required - 1` is positive and `clz32` is meaningful.
+  return 1 << (32 - Math.clz32(required - 1));
 }
 
 /**
@@ -216,15 +276,17 @@ export function indexSlotCount(connectionCount: number): number {
  * millisecond.
  */
 export function bucketOf(uuidLow32: number, slots: number): number {
-  void uuidLow32;
-  void slots;
-  throw new Error("not implemented");
+  assertUint32("uuid_low32", uuidLow32);
+  if (!isPowerOfTwo(slots)) {
+    throw new BundleFormatError(`the index slot count must be a power of two, got ${slots}`);
+  }
+  return uuidLow32 & (slots - 1);
 }
 
 /** The last four bytes of the UUID, big-endian, as an unsigned 32-bit number. */
 export function uuidLow32(id: Uint8Array): number {
-  void id;
-  throw new Error("not implemented");
+  assertUuidBytes(id);
+  return readUint32BE(id, CONNECTION_ID_BYTES - 4);
 }
 
 /**
@@ -232,69 +294,95 @@ export function uuidLow32(id: Uint8Array): number {
  * the bucket, so the fingerprint is an independent check.
  */
 export function uuidHigh32(id: Uint8Array): number {
-  void id;
-  throw new Error("not implemented");
+  assertUuidBytes(id);
+  return readUint32BE(id, 0);
 }
 
 /** Absolute offset of index slot `slot`. */
 export function indexSlotOffset(indexSectionOffset: number, slot: number): number {
-  void indexSectionOffset;
-  void slot;
-  throw new Error("not implemented");
+  return indexSectionOffset + slot * INDEX_SLOT_BYTES;
 }
 
 /** Absolute offset of section-table entry `entryIndex`. */
 export function sectionEntryOffset(entryIndex: number): number {
-  void entryIndex;
-  throw new Error("not implemented");
+  return SECTION_TABLE_OFFSET + entryIndex * SECTION_ENTRY_BYTES;
 }
 
 /** Absolute offset of connection record `recordIndex` within the CONN section. */
 export function connRecordOffset(connSectionOffset: number, recordIndex: number): number {
-  void connSectionOffset;
-  void recordIndex;
-  throw new Error("not implemented");
+  return connSectionOffset + recordIndex * CONN_RECORD_BYTES;
 }
 
-/** Absolute offset of field descriptor `fieldIndex` inside a connection record. */
+/**
+ * Absolute offset of field descriptor `fieldIndex` inside a connection record.
+ *
+ * Bounded, unlike the other offset helpers: a record is fixed width precisely so
+ * the index can address it, and an out-of-range field index would silently point
+ * into the *next* connection's id rather than fail.
+ */
 export function fieldDescriptorOffset(recordOffset: number, fieldIndex: number): number {
-  void recordOffset;
-  void fieldIndex;
-  throw new Error("not implemented");
+  if (!Number.isInteger(fieldIndex) || fieldIndex < 0 || fieldIndex >= CONN_MAX_FIELDS) {
+    throw new BundleFormatError(
+      `field index must be in [0, ${CONN_MAX_FIELDS}), got ${fieldIndex}`,
+    );
+  }
+  return recordOffset + CONN_HEADER_BYTES + fieldIndex * FIELD_DESCRIPTOR_BYTES;
 }
 
 /** Absolute offset of group record `groupIndex` within the GRUP section. */
 export function grupRecordOffset(grupSectionOffset: number, groupIndex: number): number {
-  void grupSectionOffset;
-  void groupIndex;
-  throw new Error("not implemented");
+  return grupSectionOffset + groupIndex * GRUP_RECORD_BYTES;
 }
 
 /** Absolute offset of bucket entry `entryIndex` within a group's bucket. */
 export function bucketEntryOffset(bucketOffset: number, entryIndex: number): number {
-  void bucketOffset;
-  void entryIndex;
-  throw new Error("not implemented");
+  return bucketOffset + entryIndex * BUCKET_ENTRY_BYTES;
 }
 
 /** Absolute offset of filter entry `filterIndex` within the FILT section. */
 export function filtEntryOffset(filtSectionOffset: number, filterIndex: number): number {
-  void filtSectionOffset;
-  void filterIndex;
-  throw new Error("not implemented");
+  return filtSectionOffset + filterIndex * FILT_ENTRY_BYTES;
 }
+
+/** `<shard>_<canonical uuid>`, the only form a connection id is ever written in. */
+const CONNECTION_ID_PATTERN =
+  /^([a-z]{4})_([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})$/;
 
 /** Split a `<shard>_<uuid>` connection id into its prefix and sixteen UUID bytes. */
 export function parseConnectionId(connectionId: string): {
   shard: string;
   uuid: Uint8Array;
 } {
-  void connectionId;
-  throw new Error("not implemented");
+  const match = CONNECTION_ID_PATTERN.exec(connectionId);
+  if (match === null) {
+    throw new BundleFormatError(
+      "a connection id is four lowercase letters, an underscore, then a UUID",
+    );
+  }
+  // Group 1 is the shard; groups 2..6 are the UUID's hex runs, which concatenate
+  // to exactly 32 characters. `replaceAll` on the tail is simpler than joining
+  // the groups back up and cannot reintroduce a separator the pattern rejected.
+  const shard = connectionId.slice(0, SHARD_PREFIX_BYTES);
+  const hex = connectionId.slice(SHARD_PREFIX_BYTES + 1).replaceAll("-", "");
+  const uuid = new Uint8Array(CONNECTION_ID_BYTES);
+  for (let i = 0; i < CONNECTION_ID_BYTES; i += 1) {
+    uuid[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return { shard, uuid };
+}
+
+/** Printable ASCII, so a corrupt kind cannot smuggle control characters into a log. */
+function isPrintableAscii(code: number): boolean {
+  return code >= 0x20 && code <= 0x7e;
 }
 
 /** The four ASCII characters of a section kind, for diagnostics. */
 export function sectionKindName(kind: number): string {
-  void kind;
-  throw new Error("not implemented");
+  assertUint32("section kind", kind);
+  let name = "";
+  for (let shift = 0; shift < 32; shift += 8) {
+    const code = (kind >>> shift) & 0xff;
+    name += isPrintableAscii(code) ? String.fromCharCode(code) : "?";
+  }
+  return name;
 }
