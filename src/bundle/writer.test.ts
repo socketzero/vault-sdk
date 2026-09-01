@@ -7,8 +7,14 @@
 
 import { describe, expect, it } from "vitest";
 import { base64Encode, hexDecode, utf8Decode } from "../encoding.js";
-import type { BundleInput, ConnectionInput, KeyGroup, SealedEnvelope } from "../types.js";
-import { BundleCapacityError, SEAL_ALGORITHM } from "../types.js";
+import type {
+  BundleInput,
+  ConnectionInput,
+  KeyGroup,
+  PublicKey,
+  SealedEnvelope,
+} from "../types.js";
+import { asPublicKey, BundleCapacityError, SEAL_ALGORITHM } from "../types.js";
 import {
   BUCKET_ENTRY_BYTES,
   BUCKET_ENTRY_OFFSET,
@@ -77,7 +83,8 @@ function bytes(length: number, fill: number): Uint8Array {
 function group(groupId: string, overrides: Partial<KeyGroup> = {}): KeyGroup {
   return {
     groupId,
-    publicKey: bytes(32, 0x0b),
+    publicKey: asPublicKey(bytes(32, 0x0b)),
+    generation: 1,
     bucket: [{ keyId: KEY_ID_A, wrapped: bytes(60, 0x0c) }],
     ...overrides,
   };
@@ -638,7 +645,7 @@ describe("a connection record", () => {
 
 describe("a key group record", () => {
   it("stores the public half in the clear, with the group's own generation", () => {
-    const publicKey = bytes(32, 0x2a);
+    const publicKey = asPublicKey(bytes(32, 0x2a));
     const buffer = writeBundle(bundle({ groups: [group(GROUP_A, { publicKey, generation: 4 })] }));
     const at = grupRecordOffset(section(buffer, SECTION_KIND.GRUP).offset, 0);
 
@@ -651,8 +658,10 @@ describe("a key group record", () => {
     expect(viewOf(buffer).getUint32(at + GRUP_OFFSET.GENERATION, true)).toBe(4);
   });
 
-  it("defaults a group with no rotation counter to zero", () => {
-    const buffer = writeBundle(bundle());
+  it("writes a counter of zero as zero, and never invents one", () => {
+    // `KeyGroup.generation` is required, so zero here is a claim the caller
+    // made — a group that has never rotated — not a field the writer filled in.
+    const buffer = writeBundle(bundle({ groups: [group(GROUP_A, { generation: 0 })] }));
     const at = grupRecordOffset(section(buffer, SECTION_KIND.GRUP).offset, 0);
     expect(viewOf(buffer).getUint32(at + GRUP_OFFSET.GENERATION, true)).toBe(0);
   });
@@ -743,7 +752,7 @@ describe("a key group record", () => {
 
   it.each([
     ["an id that is not a UUID", { groupId: "not-a-uuid" }],
-    ["a public key that is not 32 bytes", { publicKey: bytes(31, 1) }],
+    ["a public key that is not 32 bytes", { publicKey: bytes(31, 1) as PublicKey }],
     ["a generation that is not a uint32", { generation: -1 }],
     ["an empty bucket", { bucket: [] }],
     [

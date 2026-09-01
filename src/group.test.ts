@@ -1,15 +1,25 @@
 import { describe, expect, it } from "vitest";
 
+import { deriveWrapKey } from "./api-key.js";
+import { fieldAssociatedData, open, seal } from "./envelope.js";
 import {
   buildBucket,
   findBucketEntry,
   generateGroup,
+  rotateGroup,
   unwrap,
   WRAPPED_PRIVATE_KEY_BYTES,
   wrap,
 } from "./group.js";
-import type { BucketEntry, KeyGroup } from "./types.js";
-import { VaultDecryptionError } from "./types.js";
+import type {
+  ApiKeyBytes,
+  BucketEntry,
+  KeyGroup,
+  PrivateKey,
+  PublicKey,
+  SealedField,
+} from "./types.js";
+import { asApiKeyBytes, asPrivateKey, asPublicKey, VaultDecryptionError } from "./types.js";
 
 const TENANT = "tenant_01JC0000000000000000000000";
 const OTHER_TENANT = "tenant_01JC1111111111111111111111";
@@ -17,8 +27,15 @@ const GROUP = "default";
 const OTHER_GROUP = "staging";
 
 /** A stand-in for the raw 32 bytes `parseApiKey` hands back. */
-function apiKeyBytes(): Uint8Array {
-  return globalThis.crypto.getRandomValues(new Uint8Array(32));
+function apiKeyBytes(): ApiKeyBytes {
+  return asApiKeyBytes(globalThis.crypto.getRandomValues(new Uint8Array(32)));
+}
+
+/** An `ArrayBuffer`-backed copy, which is what Web Crypto's `BufferSource` wants. */
+function buffer(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
+  const copy = new Uint8Array(bytes.length);
+  copy.set(bytes);
+  return copy;
 }
 
 function corrupt(entry: BucketEntry, index: number): BucketEntry {
@@ -32,7 +49,82 @@ function corrupt(entry: BucketEntry, index: number): BucketEntry {
 }
 
 function groupOf(bucket: readonly BucketEntry[]): KeyGroup {
-  return { groupId: GROUP, publicKey: new Uint8Array(32), bucket };
+  return { groupId: GROUP, publicKey: asPublicKey(new Uint8Array(32)), generation: 1, bucket };
+}
+
+// ---------------------------------------------------------------------------
+// Independent reimplementations of the two AAD constructions, so the vector
+// tests pin what `group.ts` actually feeds AES-GCM rather than agreeing with
+// the implementation they are meant to check.
+// ---------------------------------------------------------------------------
+
+/** `AAD(a, b, ...) = u32be(len(utf8(a))) || utf8(a) || ...` — the spec's rule. */
+function lengthPrefixedAad(...parts: readonly string[]): Uint8Array<ArrayBuffer> {
+  const encoded = parts.map((part) => new TextEncoder().encode(part));
+  const out = new Uint8Array(encoded.reduce((sum, part) => sum + 4 + part.length, 0));
+  const view = new DataView(out.buffer);
+  let offset = 0;
+  for (const part of encoded) {
+    view.setUint32(offset, part.length, false);
+    offset += 4;
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+/** The defect the spec now forbids: plain concatenation of the components. */
+function concatenatedAad(...parts: readonly string[]): Uint8Array<ArrayBuffer> {
+  return buffer(new TextEncoder().encode(parts.join("")));
+}
+
+/** Open a wrapped entry by hand, under an associated data of the test's choosing. */
+async function unwrapUnder(
+  entry: BucketEntry,
+  apiKey: ApiKeyBytes,
+  tenantId: string,
+  aad: Uint8Array<ArrayBuffer>,
+): Promise<Uint8Array> {
+  const key = await globalThis.crypto.subtle.importKey(
+    "raw",
+    buffer(await deriveWrapKey(apiKey, tenantId)),
+    { name: "AES-GCM" },
+    false,
+    ["decrypt"],
+  );
+  const opened = await globalThis.crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: buffer(entry.wrapped.subarray(0, 12)), additionalData: aad },
+    key,
+    buffer(entry.wrapped.subarray(12)),
+  );
+  return new Uint8Array(opened);
+}
+
+/** One connection's worth of sealed fields, for the rotation tests. */
+function sealFields(
+  publicKey: PublicKey,
+  values: ReadonlyMap<string, string>,
+): Promise<SealedField[]> {
+  return Promise.all(
+    Array.from(values, async ([fieldName, value]) => ({
+      identity: { connectionId: "conn_01JC", fieldName },
+      envelope: await seal(
+        new TextEncoder().encode(value),
+        publicKey,
+        fieldAssociatedData("conn_01JC", fieldName),
+      ),
+    })),
+  );
+}
+
+async function openField(field: SealedField, privateKey: PrivateKey): Promise<string> {
+  return new TextDecoder().decode(
+    await open(
+      field.envelope,
+      privateKey,
+      fieldAssociatedData(field.identity.connectionId, field.identity.fieldName),
+    ),
+  );
 }
 
 describe("generateGroup", () => {
@@ -96,13 +188,58 @@ describe("wrap", () => {
     expect(otherTenant.keyId).not.toBe(here.keyId);
   });
 
-  it("rejects a private half that is not 32 bytes", async () => {
-    await expect(wrap(new Uint8Array(31), apiKeyBytes(), TENANT, GROUP)).rejects.toThrow(
-      RangeError,
+  it("cannot be handed a private half that is not 32 bytes — the brand is the guard", () => {
+    // `wrap` used to check this at runtime. `asPrivateKey` is now the only way
+    // to produce a `PrivateKey`, so the malformed call no longer type-checks and
+    // the check lives in the one place reachable with raw bytes.
+    expect(() => asPrivateKey(new Uint8Array(31))).toThrow(RangeError);
+    expect(() => asPrivateKey(new Uint8Array(33))).toThrow(RangeError);
+  });
+});
+
+describe("the bucket's associated data", () => {
+  it("is the length-prefixed AAD(group_id, key_id) of construction.md", async () => {
+    const { privateKey } = await generateGroup();
+    const apiKey = apiKeyBytes();
+
+    const entry = await wrap(privateKey, apiKey, TENANT, GROUP);
+
+    const recovered = await unwrapUnder(
+      entry,
+      apiKey,
+      TENANT,
+      lengthPrefixedAad(GROUP, entry.keyId),
     );
-    await expect(wrap(new Uint8Array(33), apiKeyBytes(), TENANT, GROUP)).rejects.toThrow(
-      /a group private half is 32 bytes, got 33/,
+    expect(Array.from(recovered)).toEqual(Array.from(privateKey));
+  });
+
+  it("is NOT the plain concatenation the spec calls a defect", async () => {
+    const { privateKey } = await generateGroup();
+    const apiKey = apiKeyBytes();
+
+    const entry = await wrap(privateKey, apiKey, TENANT, GROUP);
+
+    await expect(
+      unwrapUnder(entry, apiKey, TENANT, concatenatedAad(GROUP, entry.keyId)),
+    ).rejects.toThrow();
+  });
+
+  it("prefixes each component, so ('ab','c') and ('a','bc') cannot collide", () => {
+    // The vector the rule exists for, stated on the helper the two tests above
+    // pin the implementation against.
+    expect(Array.from(lengthPrefixedAad("ab", "c"))).not.toEqual(
+      Array.from(lengthPrefixedAad("a", "bc")),
     );
+    expect(Array.from(concatenatedAad("ab", "c"))).toEqual(Array.from(concatenatedAad("a", "bc")));
+  });
+
+  it("binds the group id byte for byte, uncanonicalised", async () => {
+    const { privateKey } = await generateGroup();
+    const apiKey = apiKeyBytes();
+    const entry = await wrap(privateKey, apiKey, TENANT, "Default");
+
+    await expect(unwrap(entry, apiKey, TENANT, "default")).rejects.toThrow(VaultDecryptionError);
+    await expect(unwrap(entry, apiKey, TENANT, "Default")).resolves.toHaveLength(32);
   });
 });
 
@@ -182,7 +319,7 @@ describe("unwrap", () => {
     }
   });
 
-  it("reports every failure as the same error, offering no enumeration oracle", async () => {
+  it("reports every cryptographic failure as the same error, offering no enumeration oracle", async () => {
     const { privateKey } = await generateGroup();
     const apiKey = apiKeyBytes();
     const entry = await wrap(privateKey, apiKey, TENANT, GROUP);
@@ -202,6 +339,21 @@ describe("unwrap", () => {
     );
 
     expect(new Set(messages).size).toBe(1);
+  });
+
+  it("rejects a stored key id that is not 32 lowercase hex, loudly", async () => {
+    const { privateKey } = await generateGroup();
+    const apiKey = apiKeyBytes();
+    const entry = await wrap(privateKey, apiKey, TENANT, GROUP);
+
+    // An uppercase id is a *different* string. It never equals a derived id, so
+    // before this guard it produced a refusal rather than a corruption report.
+    const malformed = [entry.keyId.toUpperCase(), "", "0".repeat(31), `${"0".repeat(32)}0`, "zz"];
+    for (const keyId of malformed) {
+      await expect(
+        unwrap({ keyId, wrapped: entry.wrapped }, apiKey, TENANT, GROUP),
+      ).rejects.toThrow(/32 lowercase hex characters/);
+    }
   });
 
   it("corrupt(): guards against an index outside the entry", () => {
@@ -231,10 +383,13 @@ describe("the key bucket", () => {
     }
   });
 
-  it("builds an empty bucket for no keys", async () => {
+  it("refuses to build an empty bucket — a group with no key can never be read again", async () => {
     const { privateKey } = await generateGroup();
 
-    await expect(buildBucket(privateKey, [], TENANT, GROUP)).resolves.toEqual([]);
+    await expect(buildBucket(privateKey, [], TENANT, GROUP)).rejects.toThrow(RangeError);
+    await expect(buildBucket(privateKey, [], TENANT, GROUP)).rejects.toThrow(
+      /at least one API key/,
+    );
   });
 
   it("rotates: a new K1 wrapped only for the surviving keys", async () => {
@@ -277,6 +432,8 @@ describe("findBucketEntry", () => {
   });
 
   it("returns undefined for an empty bucket", async () => {
+    // Unconstructable through `buildBucket`, but a bundle read off disk can
+    // still carry one, and reading must not crash on it.
     await expect(findBucketEntry(groupOf([]), apiKeyBytes(), TENANT)).resolves.toBeUndefined();
   });
 
@@ -288,9 +445,194 @@ describe("findBucketEntry", () => {
     await expect(findBucketEntry(groupOf(bucket), apiKey, OTHER_TENANT)).resolves.toBeUndefined();
   });
 
-  it("ignores a malformed key id rather than throwing", async () => {
+  it("reports a malformed stored key id as corruption instead of as a miss", async () => {
+    const { privateKey } = await generateGroup();
+    const apiKey = apiKeyBytes();
+    const [entry] = await buildBucket(privateKey, [apiKey], TENANT, GROUP);
+    expect(entry).toBeDefined();
+    if (entry === undefined) {
+      return;
+    }
+
+    // The entry IS this key's. Uppercased, it silently never matched.
+    const shouted = { keyId: entry.keyId.toUpperCase(), wrapped: entry.wrapped };
+    await expect(findBucketEntry(groupOf([shouted]), apiKey, TENANT)).rejects.toThrow(
+      /32 lowercase hex characters/,
+    );
     await expect(
-      findBucketEntry(groupOf([{ keyId: "", wrapped: new Uint8Array(0) }]), apiKeyBytes(), TENANT),
-    ).resolves.toBeUndefined();
+      findBucketEntry(groupOf([{ keyId: "", wrapped: new Uint8Array(0) }]), apiKey, TENANT),
+    ).rejects.toThrow(RangeError);
+  });
+
+  it("scans the whole bucket and does not stop early on a hit", async () => {
+    const { privateKey } = await generateGroup();
+    const keys = [apiKeyBytes(), apiKeyBytes(), apiKeyBytes()];
+    const bucket = await buildBucket(privateKey, keys, TENANT, GROUP);
+    const last = bucket[bucket.length - 1];
+    const first = keys[0];
+    expect(last).toBeDefined();
+    expect(first).toBeDefined();
+    if (last === undefined || first === undefined) {
+      return;
+    }
+
+    // `adr/0012` requires the scan not to short-circuit. A getter on the last
+    // entry proves the loop reaches it even though the first entry matched.
+    let lastRead = 0;
+    const observed: BucketEntry[] = [
+      ...bucket.slice(0, -1),
+      {
+        get keyId(): string {
+          lastRead += 1;
+          return last.keyId;
+        },
+        wrapped: last.wrapped,
+      },
+    ];
+
+    await expect(findBucketEntry(groupOf(observed), first, TENANT)).resolves.toBeDefined();
+    // Once in the validation pass, once in the constant-time scan.
+    expect(lastRead).toBe(2);
+  });
+});
+
+describe("rotateGroup", () => {
+  const FIELDS = new Map([
+    ["password", "hunter2"],
+    ["refresh_token", "rt_0000"],
+  ]);
+
+  it("returns a new K1, every field resealed to it, and a rebuilt bucket, as one result", async () => {
+    const old = await generateGroup();
+    const surviving = apiKeyBytes();
+    const fields = await sealFields(old.publicKey, FIELDS);
+
+    const rotation = await rotateGroup(old.privateKey, fields, [surviving], TENANT, GROUP);
+
+    expect(Array.from(rotation.publicKey)).not.toEqual(Array.from(old.publicKey));
+    expect(Array.from(rotation.privateKey)).not.toEqual(Array.from(old.privateKey));
+    expect(rotation.fields).toHaveLength(2);
+    expect(rotation.bucket).toHaveLength(1);
+
+    for (const field of rotation.fields) {
+      expect(await openField(field, rotation.privateKey)).toBe(
+        FIELDS.get(field.identity.fieldName),
+      );
+    }
+  });
+
+  it("writes nothing: the caller's own fields are untouched", async () => {
+    const old = await generateGroup();
+    const fields = await sealFields(old.publicKey, FIELDS);
+    const before = fields.map((field) => field.envelope);
+
+    await rotateGroup(old.privateKey, fields, [apiKeyBytes()], TENANT, GROUP);
+
+    expect(fields.map((field) => field.envelope)).toEqual(before);
+  });
+
+  it("carries each field's identity through unchanged — rotation changes the recipient only", async () => {
+    const old = await generateGroup();
+    const fields = await sealFields(old.publicKey, FIELDS);
+
+    const rotation = await rotateGroup(old.privateKey, fields, [apiKeyBytes()], TENANT, GROUP);
+
+    expect(rotation.fields.map((field) => field.identity)).toEqual(
+      fields.map((field) => field.identity),
+    );
+
+    // The AAD still binds that identity, so a resealed envelope moved into
+    // another field's slot still fails to open.
+    const [resealed] = rotation.fields;
+    expect(resealed).toBeDefined();
+    if (resealed === undefined) {
+      return;
+    }
+    await expect(
+      open(
+        resealed.envelope,
+        rotation.privateKey,
+        fieldAssociatedData(resealed.identity.connectionId, "api_key"),
+      ),
+    ).rejects.toThrow(VaultDecryptionError);
+  });
+
+  it("reseals to envelopes the old private half can no longer open", async () => {
+    const old = await generateGroup();
+    const fields = await sealFields(old.publicKey, FIELDS);
+
+    const rotation = await rotateGroup(old.privateKey, fields, [apiKeyBytes()], TENANT, GROUP);
+
+    for (const field of rotation.fields) {
+      await expect(openField(field, old.privateKey)).rejects.toThrow(VaultDecryptionError);
+    }
+  });
+
+  it("builds a bucket only the surviving keys can open", async () => {
+    const old = await generateGroup();
+    const surviving = apiKeyBytes();
+    const removed = apiKeyBytes();
+
+    const rotation = await rotateGroup(
+      old.privateKey,
+      await sealFields(old.publicKey, FIELDS),
+      [surviving],
+      TENANT,
+      GROUP,
+    );
+
+    const [entry] = rotation.bucket;
+    expect(entry).toBeDefined();
+    if (entry === undefined) {
+      return;
+    }
+    expect(Array.from(await unwrap(entry, surviving, TENANT, GROUP))).toEqual(
+      Array.from(rotation.privateKey),
+    );
+    await expect(unwrap(entry, removed, TENANT, GROUP)).rejects.toThrow(VaultDecryptionError);
+  });
+
+  it("fails whole when one field cannot be opened — there is no partial result", async () => {
+    const old = await generateGroup();
+    const stranger = await generateGroup();
+    const mine = await sealFields(old.publicKey, new Map([["password", "hunter2"]]));
+    const orphan = await sealFields(stranger.publicKey, new Map([["refresh_token", "rt_0000"]]));
+
+    await expect(
+      rotateGroup(old.privateKey, [...mine, ...orphan], [apiKeyBytes()], TENANT, GROUP),
+    ).rejects.toThrow(VaultDecryptionError);
+  });
+
+  it("refuses a rotation that would leave no surviving key", async () => {
+    const old = await generateGroup();
+
+    await expect(
+      rotateGroup(old.privateKey, await sealFields(old.publicKey, FIELDS), [], TENANT, GROUP),
+    ).rejects.toThrow(/at least one API key/);
+  });
+
+  it("rotates a group that holds no fields yet", async () => {
+    const old = await generateGroup();
+
+    const rotation = await rotateGroup(old.privateKey, [], [apiKeyBytes()], TENANT, GROUP);
+
+    expect(rotation.fields).toEqual([]);
+    expect(rotation.bucket).toHaveLength(1);
+  });
+
+  it("keeps every key id across the rotation — the salt is the tenant, not the public half", async () => {
+    const old = await generateGroup();
+    const apiKey = apiKeyBytes();
+    const before = await buildBucket(old.privateKey, [apiKey], TENANT, GROUP);
+
+    const rotation = await rotateGroup(
+      old.privateKey,
+      await sealFields(old.publicKey, FIELDS),
+      [apiKey],
+      TENANT,
+      GROUP,
+    );
+
+    expect(rotation.bucket.map((entry) => entry.keyId)).toEqual(before.map((entry) => entry.keyId));
   });
 });

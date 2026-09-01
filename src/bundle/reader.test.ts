@@ -345,6 +345,52 @@ async function stampChecksum(bytes: Uint8Array<ArrayBuffer>): Promise<void> {
   bytes.set(new Uint8Array(digest, 0, 28), HEADER_OFFSET.CHECKSUM);
 }
 
+/** The same check `verifyChecksum` does, for a bundle the reader refuses to open. */
+async function checksumIsValid(bytes: Uint8Array<ArrayBuffer>): Promise<boolean> {
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", bytes.subarray(HEADER_BYTES)),
+    0,
+    28,
+  );
+  const stored = bytes.subarray(HEADER_OFFSET.CHECKSUM, HEADER_OFFSET.CHECKSUM + 28);
+  return digest.every((byte, i) => byte === stored[i]);
+}
+
+/**
+ * The name of an algorithm Web Crypto was handed, however it was spelled.
+ *
+ * `unknown` and a runtime narrowing rather than the DOM's
+ * `AlgorithmIdentifier`, which this build's `lib` does not carry.
+ */
+function algorithmName(algorithm: unknown): string {
+  if (typeof algorithm === "string") {
+    return algorithm;
+  }
+  if (typeof algorithm === "object" && algorithm !== null && "name" in algorithm) {
+    return String(algorithm.name);
+  }
+  return "";
+}
+
+/** The `info` string of an HKDF derivation, decoded for the assertion. */
+function algorithmInfo(algorithm: unknown): string {
+  if (typeof algorithm === "object" && algorithm !== null && "info" in algorithm) {
+    const info = algorithm.info;
+    if (ArrayBuffer.isView(info)) {
+      // Copied, because a view onto an unknown buffer is not a decodable
+      // `BufferSource` as far as the compiler is concerned.
+      const bytes = Uint8Array.from(new Uint8Array(info.buffer, info.byteOffset, info.byteLength));
+      return new TextDecoder().decode(bytes);
+    }
+  }
+  return algorithmName(algorithm);
+}
+
+/** The absolute offset of one of a connection record's field descriptors. */
+function fieldDescriptorAt(recordOffset: number, fieldIndex: number): number {
+  return recordOffset + CONN_HEADER_BYTES + fieldIndex * FIELD_DESCRIPTOR_BYTES;
+}
+
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
@@ -495,10 +541,112 @@ describe("readBundle: refusing what it cannot read", () => {
     expect(readBundle(bundle.bytes).section("FILT")?.length).toBe(0);
   });
 
+  it("refuses a bundle missing a section the schema requires", () => {
+    // bundle/schema.json requires header, index, groups, connections and
+    // filters. STRS is the arena and is not among them.
+    for (const kind of ["INDX", "CONN", "GRUP", "FILT"] as const) {
+      expect(() => readBundle(buildBundle({ omit: [kind] }).bytes)).toThrow(
+        new RegExp(`must carry a ${kind} section`),
+      );
+    }
+  });
+
+  it("refuses a section claiming more records than it holds", () => {
+    const claim = (entryIndex: number, count: number): Uint8Array<ArrayBuffer> => {
+      const bundle = fixture();
+      new DataView(bundle.bytes.buffer).setUint32(
+        SECTION_TABLE_OFFSET + entryIndex * SECTION_ENTRY_BYTES + SECTION_ENTRY_OFFSET.COUNT,
+        count,
+        true,
+      );
+      return bundle.bytes;
+    };
+    // A count larger than the section reads whatever follows it as records of
+    // this section's shape.
+    expect(() => readBundle(claim(1, 2))).toThrow(/section CONN claims 2 records/);
+    expect(() => readBundle(claim(2, 3))).toThrow(/section GRUP claims 3 records/);
+    expect(() => readBundle(claim(3, 4))).toThrow(/section FILT claims 4 records/);
+  });
+
   it("reads a bundle handed over as a bare ArrayBuffer", () => {
     const bundle = fixture();
     const copy = bundle.bytes.slice();
     expect(readBundle(copy.buffer).connectionCount).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A freshly loaded bundle is entirely sealed
+// ---------------------------------------------------------------------------
+
+describe("readBundle: a loaded bundle is entirely sealed", () => {
+  /** The attack: forge the plaintext, publish the flag, re-stamp the checksum. */
+  const injectCredential = async (): Promise<Uint8Array<ArrayBuffer>> => {
+    const bundle = fixture();
+    const view = new DataView(bundle.bytes.buffer);
+    const at = fieldDescriptorAt(bundle.recordOffsets[0] as number, 0);
+    const slot = view.getUint32(at + FIELD_DESCRIPTOR_OFFSET.STRS_OFFSET, true);
+
+    const forged = TEXT.encode("sk-live-attacker-controlled");
+    bundle.bytes.set(forged, slot);
+    view.setUint32(at + FIELD_DESCRIPTOR_OFFSET.PLAIN_LEN, forged.byteLength, true);
+    view.setUint8(at + FIELD_DESCRIPTOR_OFFSET.STATE, FieldState.Open);
+    await stampChecksum(bundle.bytes);
+    return bundle.bytes;
+  };
+
+  it("refuses a field that arrives already open, credential injection and all", async () => {
+    const attacked = await injectCredential();
+
+    // The checksum is unkeyed, so it is no obstacle: the forged bundle carries
+    // a perfectly valid one and would pass verifyChecksum.
+    await expect(checksumIsValid(attacked)).resolves.toBe(true);
+
+    // Without the load-time check the field would read back as the attacker's
+    // bytes with no cryptography executed at all.
+    expect(() => readBundle(attacked)).toThrow(/arrives open/);
+    expect(() => readBundle(attacked)).toThrow(BundleFormatError);
+  });
+
+  it("refuses a sealed field that still claims a plaintext length", () => {
+    // The other half of the invariant: state 0 with plain_len set would have
+    // fieldBytes return the envelope while the cache says a secret is there.
+    const bundle = fixture();
+    new DataView(bundle.bytes.buffer).setUint32(
+      fieldDescriptorAt(bundle.recordOffsets[0] as number, 1) + FIELD_DESCRIPTOR_OFFSET.PLAIN_LEN,
+      7,
+      true,
+    );
+    expect(() => readBundle(bundle.bytes)).toThrow(/field 1 of the connection at .* arrives open/);
+  });
+
+  it("refuses a group whose private half arrives unwrapped", () => {
+    const bundle = fixture();
+    const view = new DataView(bundle.bytes.buffer);
+    const bundleView = readBundle(bundle.bytes);
+    const descriptor = bundleView.group(0)?.privateKeyDescriptor();
+    if (descriptor === undefined) {
+      throw new Error("the fixture must carry a group");
+    }
+    // Exactly what a legitimate write-back does — but done by the publisher,
+    // which has no business shipping an unwrapped K1.
+    view.setUint32(descriptor.descriptorOffset + FIELD_DESCRIPTOR_OFFSET.PLAIN_LEN, 32, true);
+    view.setUint8(descriptor.descriptorOffset + FIELD_DESCRIPTOR_OFFSET.STATE, FieldState.Open);
+    expect(() => readBundle(bundle.bytes)).toThrow(/private half of group 0 arrives open/);
+  });
+
+  it("refuses a record claiming more fields than a record can hold", () => {
+    const bundle = fixture();
+    new DataView(bundle.bytes.buffer).setUint32(
+      (bundle.recordOffsets[0] as number) + CONN_OFFSET.FIELD_COUNT,
+      9,
+      true,
+    );
+    expect(() => readBundle(bundle.bytes)).toThrow(/at most 8 fields, got 9/);
+  });
+
+  it("accepts the same bundle untouched, so the check is not vacuous", () => {
+    expect(readBundle(fixture().bytes).connectionCount).toBe(1);
   });
 });
 
@@ -525,13 +673,15 @@ describe("readBundle: the header and the section table", () => {
   it("finds a section by kind and reports nothing for one that is absent", () => {
     const present = readBundle(fixture().bytes);
     expect(present.section("CONN")?.count).toBe(1);
-    const without = readBundle(buildBundle({ omit: ["FILT"] }).bytes);
-    expect(without.section("FILT")).toBeUndefined();
+    // STRS is the one section the schema does not require: a bundle whose
+    // values are all fixed-width needs no arena.
+    const without = readBundle(buildBundle({ omit: ["STRS"] }).bytes);
+    expect(without.section("STRS")).toBeUndefined();
     expect(without.header.sections).toBe(4);
   });
 
-  it("counts nothing when the record sections are absent", () => {
-    const view = readBundle(buildBundle({ omit: ["CONN", "GRUP"] }).bytes);
+  it("counts nothing when the record sections are present and empty", () => {
+    const view = readBundle(buildBundle().bytes);
     expect(view.connectionCount).toBe(0);
     expect(view.groupCount).toBe(0);
   });
@@ -605,9 +755,9 @@ describe("lookup", () => {
     expect(view.lookup(`bbbb_${CONNECTION_UUID}`)).toBeUndefined();
   });
 
-  it("misses when the bundle carries no index or no records", () => {
-    expect(readBundle(buildBundle({ omit: ["INDX"] }).bytes).lookup(CONNECTION_ID)).toBeUndefined();
-    expect(readBundle(buildBundle({ omit: ["CONN"] }).bytes).lookup(CONNECTION_ID)).toBeUndefined();
+  it("misses when the bundle carries no connections at all", () => {
+    // Every slot of an empty shard's table is empty, so the first probe ends it.
+    expect(readBundle(buildBundle().bytes).lookup(CONNECTION_ID)).toBeUndefined();
   });
 
   it("probes past a bucket collision to the right record", () => {
@@ -771,6 +921,59 @@ describe("a connection record", () => {
     expect(connection.visible("absent")).toBeUndefined();
   });
 
+  it("resolves a visible key by bytes, not by decoding every key it walks", () => {
+    // Two string values before the one asked for. A walk that decoded as it
+    // went would allocate five strings; this one allocates the value it was
+    // asked for and nothing else.
+    const bundle = buildBundle({
+      connections: [
+        {
+          ...connection(CONNECTION_UUID),
+          visible: { alpha: "first", beta: "second", wanted: "third", omega: true },
+        },
+      ],
+    });
+    const record = readBundle(bundle.bytes).lookup(CONNECTION_ID);
+
+    const decode = vi.spyOn(TextDecoder.prototype, "decode");
+    try {
+      expect(record?.visible("wanted")).toBe("third");
+      expect(decode.mock.calls.length).toBe(1);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("tells apart a key of the same length that is not the same key", () => {
+    // "provider" and "provideX" are both eight bytes: the length check passes
+    // and the byte comparison has to do the work.
+    const connection = record();
+    expect(connection.visible("provideX")).toBeUndefined();
+    expect(connection.visible("provider")).toBe("example");
+  });
+
+  it("takes the first match and stops, because duplicate keys are legal", () => {
+    // A JavaScript object cannot hold the key twice, so the second entry is
+    // built under a key of the same length and renamed in the bytes.
+    const bundle = buildBundle({
+      connections: [
+        {
+          ...connection(CONNECTION_UUID),
+          visible: { duplicate: "first", duplicatf: "second" },
+        },
+      ],
+    });
+    const dataView = new DataView(bundle.bytes.buffer);
+    const recordOffset = bundle.recordOffsets[0] as number;
+    const visibleAt = dataView.getUint32(recordOffset + CONN_OFFSET.VISIBLE_OFFSET, true);
+    const secondAt = visibleAt + entryEnd(dataView, visibleAt);
+    bundle.bytes.set(TEXT.encode("duplicate"), secondAt + 3);
+
+    const duplicated = readBundle(bundle.bytes).lookup(CONNECTION_ID);
+    expect(duplicated?.visibleKeys()).toEqual(["duplicate", "duplicate"]);
+    expect(duplicated?.visible("duplicate")).toBe("first");
+  });
+
   it("returns the id as a view and verifies all sixteen bytes", () => {
     const connection = record();
     const id = connection.idBytes();
@@ -830,10 +1033,8 @@ describe("a connection record", () => {
     );
   });
 
-  it("has no addressable records at all when CONN is absent", () => {
-    expect(() => readBundle(buildBundle({ omit: ["CONN"] }).bytes).connectionAt(0)).toThrow(
-      BundleFormatError,
-    );
+  it("has no addressable records at all when CONN is empty", () => {
+    expect(() => readBundle(buildBundle().bytes).connectionAt(0)).toThrow(BundleFormatError);
   });
 });
 
@@ -971,7 +1172,7 @@ describe("key groups", () => {
     expect(view.group(1)).toBeUndefined();
     expect(view.group(-1)).toBeUndefined();
     expect(view.group(0.5)).toBeUndefined();
-    expect(readBundle(buildBundle({ omit: ["GRUP"] }).bytes).group(0)).toBeUndefined();
+    expect(readBundle(buildBundle().bytes).group(0)).toBeUndefined();
   });
 
   it("finds a group by its id and refuses anything that is not one", () => {
@@ -1032,7 +1233,7 @@ describe("filters", () => {
     expect(view.filter(2)).toBeUndefined();
     expect(view.filter(-1)).toBeUndefined();
     expect(view.filter(1.5)).toBeUndefined();
-    expect(readBundle(buildBundle({ omit: ["FILT"] }).bytes).filter(0)).toBeUndefined();
+    expect(readBundle(buildBundle().bytes).filter(0)).toBeUndefined();
   });
 });
 
@@ -1070,6 +1271,46 @@ describe("readFieldDescriptor", () => {
 
   it("refuses a state that is neither sealed nor open", () => {
     expect(() => readFieldDescriptor(descriptorBytes(2), 0)).toThrow(/state is 0 or 1/);
+  });
+
+  it("refuses a plaintext length larger than the slot it claims to live in", () => {
+    const bytes = descriptorBytes(FieldState.Open);
+    const view = new DataView(bytes.buffer);
+    view.setUint32(FIELD_DESCRIPTOR_OFFSET.SEALED_LEN, 71, true);
+    view.setUint32(FIELD_DESCRIPTOR_OFFSET.PLAIN_LEN, 111, true);
+    expect(() => readFieldDescriptor(bytes, 0)).toThrow(
+      /plaintext of 111 bytes cannot live in its 71-byte slot/,
+    );
+    expect(() => readFieldDescriptor(bytes, 0)).toThrow(BundleFormatError);
+  });
+
+  it("allows a plaintext exactly as long as the slot", () => {
+    const bytes = descriptorBytes(FieldState.Open);
+    new DataView(bytes.buffer).setUint32(FIELD_DESCRIPTOR_OFFSET.PLAIN_LEN, 64, true);
+    expect(readFieldDescriptor(bytes, 0).plainLen).toBe(64);
+  });
+
+  it("does not let a forged plain_len read the next field's slot", () => {
+    // The fixture's arena places `secret`'s 70 bytes immediately after
+    // `api_key`'s 64. In a resident buffer that neighbour may already hold
+    // another connection's opened plaintext, so a plain_len of 111 would hand
+    // 47 bytes of it back under this field's name.
+    const bundle = fixture();
+    const bundleView = readBundle(bundle.bytes);
+    const connection = bundleView.lookup(CONNECTION_ID);
+    const descriptor = connection?.field("api_key");
+    if (connection === undefined || descriptor === undefined) {
+      throw new Error("the fixture must carry a sealed api_key");
+    }
+    const opened = bundleView.writeBack(descriptor, TEXT.encode("hunter2"));
+    new DataView(bundle.bytes.buffer).setUint32(
+      opened.descriptorOffset + FIELD_DESCRIPTOR_OFFSET.PLAIN_LEN,
+      111,
+      true,
+    );
+    expect(() => connection.fieldBytes(opened)).toThrow(
+      /plaintext of 111 bytes cannot live in its 64-byte slot/,
+    );
   });
 });
 
@@ -1216,6 +1457,10 @@ describe("zeroTail", () => {
 });
 
 describe("decoyUnwrap", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("spends the time a real unwrap would, and reports nothing", async () => {
     await expect(decoyUnwrap()).resolves.toBeUndefined();
   });
@@ -1224,5 +1469,35 @@ describe("decoyUnwrap", () => {
     const started = performance.now();
     await decoyUnwrap();
     expect(performance.now() - started).toBeGreaterThan(0);
+  });
+
+  it("mirrors a real unwrap operation for operation", async () => {
+    // A real unwrap derives twice under different info strings, imports the
+    // wrap key and decrypts. A decoy that derived once measured 12% short and
+    // short in the same direction every time — a bias an attacker averages out.
+    // `vi.spyOn` calls through, so this records the real operations rather
+    // than replacing them.
+    const importKey = vi.spyOn(crypto.subtle, "importKey");
+    const deriveBits = vi.spyOn(crypto.subtle, "deriveBits");
+    const decrypt = vi.spyOn(crypto.subtle, "decrypt");
+
+    await decoyUnwrap();
+
+    // Two HKDF derivations, under the two info strings the bucket format pins,
+    // to the key id's 16 bytes and the wrap key's 32.
+    const derivations = deriveBits.mock.calls.map(([algorithm, , length]) => ({
+      info: algorithmInfo(algorithm),
+      length,
+    }));
+    expect(derivations.map((one) => one.info).toSorted()).toEqual([
+      "socket0/v1/key-id",
+      "socket0/v1/tmk-wrap",
+    ]);
+    expect(derivations.map((one) => one.length).toSorted()).toEqual([128, 256]);
+    // Two HKDF key imports plus the AES-GCM wrap key: three, as in group.ts.
+    expect(
+      importKey.mock.calls.map(([, , algorithm]) => algorithmName(algorithm)).toSorted(),
+    ).toEqual(["AES-GCM", "HKDF", "HKDF"]);
+    expect(decrypt.mock.calls.length).toBe(1);
   });
 });

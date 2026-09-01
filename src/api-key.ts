@@ -5,17 +5,26 @@
  *     |__| |__| |_________________________________________| |____|
  *      3    4                     43                          6
  *
- *     key      = base62_decode(body)                              32 bytes
- *     key_id   = HKDF-SHA256(key, salt=tenant_id, "socket0/v1/key-id",   16)
- *     wrap_key = HKDF-SHA256(key, salt=tenant_id, "socket0/v1/tmk-wrap", 32)
+ *     key      = base62_decode(body)                                 32 bytes
+ *     verify   = crc32(key) == base62_decode(checksum)
+ *     key_id   = HKDF-SHA256(key, salt=utf8(tenant_id), "socket0/v1/key-id",   16)
+ *     wrap_key = HKDF-SHA256(key, salt=utf8(tenant_id), "socket0/v1/tmk-wrap", 32)
  *
  * Two different info strings over one secret, so the identifier stored in the
  * clear in every bundle is independent of the key that opens the group. The
- * salt is the **tenant id** — never the group's public half, which rotates
- * while `key_id` must not.
+ * salt is the **exact UTF-8 bytes of the tenant id** — never canonicalised,
+ * never the group's public half, which rotates while `key_id` must not.
  *
- * The derivation input is the raw 32 bytes. The prefix and the checksum are
- * packaging; changing them must not invalidate a key that already exists.
+ * Base62 is `0-9A-Za-z` in that order and the checksum is CRC-32 with the
+ * reflected IEEE polynomial `0xEDB88320` (`encoding.ts` pins both). The
+ * derivation input is the raw 32 bytes: the prefix and the checksum are
+ * packaging, and changing them must not invalidate a key that already exists.
+ *
+ * **Minting.** `generateApiKey` is the only way to make a key, and it takes
+ * nothing but an environment. `requirement/api-key-entropy` is explicit that
+ * "no code path accepts a caller-supplied key, seed or passphrase", so the
+ * `bytes → display` formatter is module-internal; the exported `formatApiKey`
+ * re-renders a key that already exists and cannot mint one.
  */
 
 import {
@@ -26,17 +35,20 @@ import {
   hexEncode,
   utf8Encode,
 } from "./encoding.js";
-import type {
-  ApiKeyEnvironment,
-  ApiKeyMaterial,
-  ApiKeyParseFailure,
-  ParsedApiKey,
+import {
+  API_KEY_MATERIAL_BYTES,
+  type ApiKeyBytes,
+  type ApiKeyEnvironment,
+  type ApiKeyMaterial,
+  type ApiKeyParseFailure,
+  asApiKeyBytes,
+  type ParsedApiKey,
 } from "./types.js";
 
 /** Fixed issuer prefix. */
 export const API_KEY_ISSUER_PREFIX = "sk0";
 /** The secret is 32 random bytes, and only ever 32 random bytes. */
-export const API_KEY_BYTES = 32;
+export const API_KEY_BYTES = API_KEY_MATERIAL_BYTES;
 /** 32 bytes in base62, fixed width. */
 export const API_KEY_BODY_CHARS = 43;
 /** A CRC-32 in base62, fixed width. */
@@ -45,6 +57,8 @@ export const API_KEY_CHECKSUM_CHARS = 6;
 export const API_KEY_DISPLAY_LENGTH = 59;
 /** The separator between the four segments. Unambiguous because the body is alphanumeric. */
 export const API_KEY_SEPARATOR = "_";
+/** The environments that may appear in the second segment, in display order. */
+export const API_KEY_ENVIRONMENTS: readonly ApiKeyEnvironment[] = ["live", "test"];
 
 /** Info string for the identifier stored in the clear in every bundle. */
 export const HKDF_INFO_KEY_ID = "socket0/v1/key-id";
@@ -59,8 +73,6 @@ export const WRAP_KEY_BYTES = 32;
 const CHECKSUM_BYTES = 4;
 /** Issuer, environment, body, checksum. */
 const SEGMENT_COUNT = 4;
-/** The environments that may appear in the second segment. */
-const ENVIRONMENTS: readonly ApiKeyEnvironment[] = ["live", "test"];
 
 /** The four segments, once their number is known. */
 type KeySegments = readonly [string, string, string, string];
@@ -68,27 +80,43 @@ type KeySegments = readonly [string, string, string, string];
 /**
  * Mint a new key: 32 bytes from `crypto.getRandomValues`, formatted for display.
  *
- * Never derived from a password, never influenced by a user, never regenerated
- * from anything reproducible (`requirement/api-key-entropy`).
+ * The **only** way to obtain key material. There is deliberately no overload
+ * taking bytes: never derived from a password, never influenced by a user,
+ * never regenerated from anything reproducible (`requirement/api-key-entropy`).
+ *
+ * @throws {RangeError} if `environment` is not one of `API_KEY_ENVIRONMENTS` —
+ *   an untyped caller passing `"prod"` would otherwise mint `sk0_prod_…`, which
+ *   the published display format has no room for.
  */
 export function generateApiKey(environment: ApiKeyEnvironment): ApiKeyMaterial {
-  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(API_KEY_BYTES));
-  return { environment, bytes, display: formatApiKey(bytes, environment) };
+  const checked = requireEnvironment(environment);
+  const bytes = asApiKeyBytes(globalThis.crypto.getRandomValues(new Uint8Array(API_KEY_BYTES)));
+  return { environment: checked, bytes, display: formatDisplay(bytes, checked) };
 }
 
 /**
- * Render 32 raw bytes as the display form, appending the base62 CRC-32 of those
- * same bytes.
+ * Re-render the display form of a key that already exists, and check it against
+ * the display carried alongside it.
  *
- * @throws {RangeError} if `bytes.length !== API_KEY_BYTES`.
+ * Not a minting function: it accepts no loose bytes, only material that
+ * `generateApiKey` or `parseApiKey` produced. It is the check for material that
+ * has been round-tripped through storage — a JSON copy keeps the display but
+ * loses nothing else, so a display edited apart from its bytes is caught here
+ * rather than at a relay that answers every bad key identically.
+ *
+ * @throws {RangeError} if the environment is unknown, the bytes are not 32, or
+ *   the recomputed display disagrees with `material.display`. No message quotes
+ *   the key.
  */
-export function formatApiKey(bytes: Uint8Array, environment: ApiKeyEnvironment): string {
-  if (bytes.length !== API_KEY_BYTES) {
-    throw new RangeError(`an API key is ${API_KEY_BYTES} bytes, got ${bytes.length}`);
+export function formatApiKey(material: ApiKeyMaterial): string {
+  const display = formatDisplay(
+    asApiKeyBytes(material.bytes),
+    requireEnvironment(material.environment),
+  );
+  if (display !== material.display) {
+    throw new RangeError("the API key material and its display form disagree");
   }
-  const body = base62Encode(bytes, API_KEY_BODY_CHARS);
-  const checksum = base62Encode(checksumBytes(bytes), API_KEY_CHECKSUM_CHARS);
-  return [API_KEY_ISSUER_PREFIX, environment, body, checksum].join(API_KEY_SEPARATOR);
+  return display;
 }
 
 /**
@@ -131,7 +159,7 @@ export function parseApiKey(display: string): ParsedApiKey {
   if (!isEnvironment(environment)) {
     return failure(
       "unknown-environment",
-      `the environment segment must be one of: ${ENVIRONMENTS.join(", ")}`,
+      `the environment segment must be one of: ${API_KEY_ENVIRONMENTS.join(", ")}`,
     );
   }
   if (body.length !== API_KEY_BODY_CHARS) {
@@ -154,7 +182,8 @@ export function parseApiKey(display: string): ParsedApiKey {
   }
 
   // 62^43 is a shade over 2^256, so a well-shaped body can still name a number
-  // too large to be 32 bytes.
+  // too large to be 32 bytes. The display regex cannot express that bound, so
+  // the parser has to: reject, never truncate (`datamodel/api-key`).
   const bytes = tryBase62Decode(body, API_KEY_BYTES);
   if (bytes === undefined) {
     return failure("body-out-of-range", `the key body does not name a ${API_KEY_BYTES}-byte value`);
@@ -169,33 +198,64 @@ export function parseApiKey(display: string): ParsedApiKey {
     return mistyped();
   }
 
-  return { ok: true, environment, bytes, display };
+  return { ok: true, environment, bytes: asApiKeyBytes(bytes), display };
 }
 
 /**
- * `HKDF-SHA256(apiKey, salt=tenantId, info="socket0/v1/key-id", 16)`.
+ * `HKDF-SHA256(apiKey, salt=utf8(tenantId), info="socket0/v1/key-id", 16)`.
  *
  * @param apiKey the RAW 32 bytes, never the display string.
- * @param tenantId the tenant id, used verbatim as the HKDF salt.
+ * @param tenantId the tenant id, whose exact UTF-8 bytes are the HKDF salt.
  * @returns 16 bytes.
  */
-export function deriveKeyId(apiKey: Uint8Array, tenantId: string): Promise<Uint8Array> {
+export function deriveKeyId(apiKey: ApiKeyBytes, tenantId: string): Promise<Uint8Array> {
   return hkdf(apiKey, tenantId, HKDF_INFO_KEY_ID, KEY_ID_BYTES);
 }
 
 /** `deriveKeyId` rendered as the 32 lowercase hex characters a bucket stores. */
-export async function deriveKeyIdHex(apiKey: Uint8Array, tenantId: string): Promise<string> {
+export async function deriveKeyIdHex(apiKey: ApiKeyBytes, tenantId: string): Promise<string> {
   return hexEncode(await deriveKeyId(apiKey, tenantId));
 }
 
 /**
- * `HKDF-SHA256(apiKey, salt=tenantId, info="socket0/v1/tmk-wrap", 32)`.
+ * `HKDF-SHA256(apiKey, salt=utf8(tenantId), info="socket0/v1/tmk-wrap", 32)`.
  *
  * @param apiKey the RAW 32 bytes, never the display string.
  * @returns 32 bytes, the AES-256-GCM key that opens a bucket entry.
  */
-export function deriveWrapKey(apiKey: Uint8Array, tenantId: string): Promise<Uint8Array> {
+export function deriveWrapKey(apiKey: ApiKeyBytes, tenantId: string): Promise<Uint8Array> {
   return hkdf(apiKey, tenantId, HKDF_INFO_WRAP_KEY, WRAP_KEY_BYTES);
+}
+
+/**
+ * Render 32 raw bytes as the display form, appending the base62 CRC-32 of those
+ * same bytes.
+ *
+ * Module-internal: exporting it would be a public path from caller-supplied
+ * bytes to a key that parses, which `requirement/api-key-entropy` forbids.
+ */
+function formatDisplay(bytes: ApiKeyBytes, environment: ApiKeyEnvironment): string {
+  const body = base62Encode(bytes, API_KEY_BODY_CHARS);
+  const checksum = base62Encode(checksumBytes(bytes), API_KEY_CHECKSUM_CHARS);
+  return [API_KEY_ISSUER_PREFIX, environment, body, checksum].join(API_KEY_SEPARATOR);
+}
+
+/**
+ * The environment, checked at runtime.
+ *
+ * The type says `"live" | "test"`, but the type is not there at runtime and the
+ * display format has exactly four characters for this segment: an unchecked
+ * `"prod"` mints a string no parser will ever accept.
+ *
+ * @throws {RangeError} on anything else.
+ */
+function requireEnvironment(environment: ApiKeyEnvironment): ApiKeyEnvironment {
+  if (!isEnvironment(environment)) {
+    throw new RangeError(
+      `the environment must be one of: ${API_KEY_ENVIRONMENTS.join(", ")}, got '${String(environment)}'`,
+    );
+  }
+  return environment;
 }
 
 /**
@@ -204,16 +264,19 @@ export function deriveWrapKey(apiKey: Uint8Array, tenantId: string): Promise<Uin
  * The two callers differ only in `info` and output length, which is the whole
  * of the separation the format relies on: `key_id` travels in the clear in
  * every bundle, `wrap_key` opens the group, and neither can be computed from
- * the other. The salt is the tenant id, which is stable across rotation.
+ * the other. The salt is the tenant id's exact UTF-8 bytes — uncanonicalised,
+ * and stable across rotation.
  */
 async function hkdf(
-  apiKey: Uint8Array,
+  apiKey: ApiKeyBytes,
   tenantId: string,
   info: string,
   byteLength: number,
 ): Promise<Uint8Array> {
   if (apiKey.length !== API_KEY_BYTES) {
-    // The commonest way to get this wrong is to hand over the display string.
+    // Unreachable through `asApiKeyBytes`, which is the only sanctioned way to
+    // brand these bytes. It stays for the untyped caller, whose commonest way
+    // to get this wrong is to hand over the display string.
     throw new RangeError(`HKDF input is the raw ${API_KEY_BYTES} key bytes, got ${apiKey.length}`);
   }
   const material = await globalThis.crypto.subtle.importKey(
@@ -268,7 +331,7 @@ function hasAllSegments(segments: readonly string[]): segments is KeySegments {
 }
 
 function isEnvironment(value: string): value is ApiKeyEnvironment {
-  return (ENVIRONMENTS as readonly string[]).includes(value);
+  return (API_KEY_ENVIRONMENTS as readonly string[]).includes(value);
 }
 
 function isBase62(text: string): boolean {

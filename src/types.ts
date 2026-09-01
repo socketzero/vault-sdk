@@ -11,6 +11,96 @@
  */
 
 // ---------------------------------------------------------------------------
+// Branded key material
+// ---------------------------------------------------------------------------
+
+/*
+ * Every key in this system is 32 raw bytes, so `Uint8Array` makes the public
+ * half, the private half and an API key mutually substitutable. That is not a
+ * cosmetic weakness: `seal(value, keypair.privateKey, aad)` type-checks, runs,
+ * and produces an envelope whose recipient is a public half nobody holds — the
+ * plaintext is gone and there is no error at the moment it is lost.
+ *
+ * The brands below make each role a distinct type. They are `unique symbol`
+ * keys, so a brand cannot be forged by writing an object literal, cannot be
+ * spelled by a caller, and does not survive JSON — a key that arrives over a
+ * wire has to be re-validated through a constructor, which is the point.
+ *
+ * The constructors do not copy. A public half read out of a bundle is a view
+ * into the caller's buffer and `product/vault-sdk/datamodel/bundle` forbids
+ * copying it; branding is a compile-time act and stays one.
+ */
+
+declare const publicKeyBrand: unique symbol;
+declare const privateKeyBrand: unique symbol;
+declare const apiKeyBytesBrand: unique symbol;
+
+/** X25519 public half, 32 raw bytes. Public — sealing needs only this. */
+export type PublicKey = Uint8Array & { readonly [publicKeyBrand]: "x25519-public" };
+
+/** X25519 private scalar, 32 raw bytes. Opens a group; never stored unwrapped. */
+export type PrivateKey = Uint8Array & { readonly [privateKeyBrand]: "x25519-private" };
+
+/**
+ * The 32 raw bytes of an API key — the HKDF input for both derivations.
+ *
+ * **Never the display string.** The prefix and the checksum are packaging;
+ * `datamodel/api-key` requires that changing them cannot invalidate a key.
+ */
+export type ApiKeyBytes = Uint8Array & { readonly [apiKeyBytesBrand]: "api-key" };
+
+/** An X25519 point. */
+export const X25519_PUBLIC_KEY_BYTES = 32;
+/** An X25519 scalar. */
+export const X25519_PRIVATE_KEY_BYTES = 32;
+/** `adr/0012-tenant-held-keys`: the key is 32 random bytes, and it is a KEK. */
+export const API_KEY_MATERIAL_BYTES = 32;
+
+/**
+ * Assert bytes are a group's public half.
+ *
+ * @throws {RangeError} if the length is wrong. A wrong-sized key is a
+ *   programming error, and it has to be loud here: carried further it becomes
+ *   an envelope that fails to open, weeks later, with the plaintext long gone.
+ */
+export function asPublicKey(bytes: Uint8Array): PublicKey {
+  if (bytes.length !== X25519_PUBLIC_KEY_BYTES) {
+    throw new RangeError(
+      `an X25519 public half is ${X25519_PUBLIC_KEY_BYTES} bytes, got ${bytes.length}`,
+    );
+  }
+  return bytes as PublicKey;
+}
+
+/**
+ * Assert bytes are a group's private half.
+ *
+ * @throws {RangeError} if the length is wrong.
+ */
+export function asPrivateKey(bytes: Uint8Array): PrivateKey {
+  if (bytes.length !== X25519_PRIVATE_KEY_BYTES) {
+    throw new RangeError(
+      `an X25519 private half is ${X25519_PRIVATE_KEY_BYTES} bytes, got ${bytes.length}`,
+    );
+  }
+  return bytes as PrivateKey;
+}
+
+/**
+ * Assert bytes are an API key's raw material.
+ *
+ * @throws {RangeError} if the length is wrong. A short key is a weak KEK, and
+ *   `requirement/api-key-entropy` makes the entropy load-bearing: an attacker
+ *   with a KV dump attacks it offline.
+ */
+export function asApiKeyBytes(bytes: Uint8Array): ApiKeyBytes {
+  if (bytes.length !== API_KEY_MATERIAL_BYTES) {
+    throw new RangeError(`an API key is ${API_KEY_MATERIAL_BYTES} bytes, got ${bytes.length}`);
+  }
+  return bytes as ApiKeyBytes;
+}
+
+// ---------------------------------------------------------------------------
 // API key
 // ---------------------------------------------------------------------------
 
@@ -21,7 +111,7 @@ export type ApiKeyEnvironment = "live" | "test";
 export interface ApiKeyMaterial {
   readonly environment: ApiKeyEnvironment;
   /** The 32 random bytes. **This**, never the display string, is the HKDF input. */
-  readonly bytes: Uint8Array;
+  readonly bytes: ApiKeyBytes;
   /** `sk0_<env>_<43 base62>_<6 base62>`, 59 characters. */
   readonly display: string;
 }
@@ -53,38 +143,75 @@ export type ParsedApiKey =
       readonly message: string;
     };
 
+/**
+ * Take the material out of a parse result, or throw.
+ *
+ * `parseKey` never throws — that is its contract, and `protocol/vault-operations`
+ * says so. This is the one sanctioned bridge for a caller who has already
+ * decided that a malformed key at this point is a bug rather than a typo (a
+ * config loader, a test fixture), and it is the only construction site of
+ * `ApiKeyFormatError`. Without it the class is an invitation to wrap a
+ * non-throwing function in `try`/`catch` and never notice the branch is dead.
+ *
+ * @throws {ApiKeyFormatError} carrying the machine reason and a safe message.
+ */
+export function requireApiKey(parsed: ParsedApiKey): ApiKeyMaterial {
+  if (!parsed.ok) {
+    throw new ApiKeyFormatError(parsed.reason, parsed.message);
+  }
+  return parsed;
+}
+
 // ---------------------------------------------------------------------------
 // Key groups and buckets
 // ---------------------------------------------------------------------------
 
-/** An X25519 keypair. The private half is returned once and never stored unwrapped. */
+/**
+ * An X25519 keypair. The private half is returned once and never stored
+ * unwrapped.
+ *
+ * The two halves are different types, so `seal(value, pair.privateKey, aad)`
+ * does not compile.
+ */
 export interface GroupKeyPair {
   /** 32 bytes, raw. Public — sealing needs only this. */
-  readonly publicKey: Uint8Array;
+  readonly publicKey: PublicKey;
   /** 32 bytes, raw. */
-  readonly privateKey: Uint8Array;
+  readonly privateKey: PrivateKey;
 }
 
 /**
  * One API key's copy of a group's private half.
  *
- * `keyId` is `HKDF(apiKey, salt=tenantId, info="socket0/v1/key-id", 16)` as 32
- * lowercase hex characters; it is stored in the clear in every bundle.
- * `wrapped` is the private half under `HKDF(..., info="socket0/v1/tmk-wrap", 32)`.
+ * `keyId` is `HKDF-SHA256(apiKey, salt=utf8(tenantId), info="socket0/v1/key-id", 16)`
+ * as 32 lowercase hex characters; it is stored in the clear in every bundle.
+ * `wrapped` is the private half under
+ * `HKDF-SHA256(apiKey, salt=utf8(tenantId), info="socket0/v1/tmk-wrap", 32)`.
  */
 export interface BucketEntry {
   readonly keyId: string;
-  /** `nonce(12) || ciphertext(32) || tag(16)`, AAD = group id || key id. */
+  /** `nonce(12) || ciphertext(32) || tag(16)`, 60 bytes. AAD = `AAD(groupId, keyId)`. */
   readonly wrapped: Uint8Array;
 }
 
-/** A key group as it travels inside a bundle: public half plus the whole bucket. */
+/**
+ * A key group as it travels inside a bundle: public half plus the whole bucket.
+ *
+ * `generation` is required. The compiled key-group schema
+ * (`.../component/shard/datamodel/key-group/schema.json`) lists it in
+ * `required`, and it decides whether a bundle is stale rather than corrupt — a
+ * question a reader cannot answer from an absent counter.
+ */
 export interface KeyGroup {
   readonly groupId: string;
   /** K1 public half, 32 raw bytes. */
-  readonly publicKey: Uint8Array;
+  readonly publicKey: PublicKey;
   /** The group's own rotation counter, distinct from the bundle's generation. */
-  readonly generation?: number;
+  readonly generation: number;
+  /**
+   * One entry per API key. Empty is not representable in the schema: a group
+   * with no key can never be opened again.
+   */
   readonly bucket: readonly BucketEntry[];
 }
 
@@ -114,22 +241,68 @@ export interface EnvelopeParts {
 }
 
 /**
- * Associated data. Always binds the identity of what is sealed — a field's
- * connection id and name, or a bucket entry's group id and key id — so an
- * envelope moved between slots fails to open even with the right key.
+ * Associated data, built by `fieldAssociatedData` or `bucketAssociatedData` and
+ * by nothing else.
+ *
+ * **Length-prefixed, per `datamodel/sealed-secret/construction.md`:**
+ *
+ *     AAD(a, b, ...) = u32be(len(utf8(a))) || utf8(a) || u32be(len(utf8(b))) || utf8(b) || ...
+ *
+ * Plain concatenation is a defect: `("conn", "1password")` and
+ * `("conn1", "password")` would produce identical associated data, so an
+ * envelope sealed for one would open under the other. Components are never
+ * canonicalised, trimmed or lower-cased — what is bound is the exact byte
+ * string the caller passed, so a mismatch fails rather than being repaired.
  */
 export type AssociatedData = Uint8Array;
 
-/** The identity a credential field's AAD binds. */
+/** The identity a credential field's AAD binds, in that order. */
 export interface FieldIdentity {
   readonly connectionId: string;
   readonly fieldName: string;
 }
 
-/** The identity a bucket entry's AAD binds. */
+/** The identity a bucket entry's AAD binds, in that order. */
 export interface BucketIdentity {
   readonly groupId: string;
+  /** Always its 32 lowercase hex characters. */
   readonly keyId: string;
+}
+
+// ---------------------------------------------------------------------------
+// Rotation
+// ---------------------------------------------------------------------------
+
+/** One sealed value together with the identity its AAD binds. */
+export interface SealedField {
+  readonly identity: FieldIdentity;
+  readonly envelope: SealedEnvelope;
+}
+
+/**
+ * What `rotateGroup` returns: a new K1, every field resealed to it, and the
+ * bucket rebuilt for the surviving API keys — **together or not at all**.
+ *
+ * `protocol/vault-operations` makes rotation one operation rather than a recipe
+ * of `generateGroup` + `seal` + `wrap` precisely so this object cannot exist
+ * half-built: a partial write leaves fields no surviving key can open, and
+ * there is no recovery path. Modelling it as one readonly result is what stops
+ * a caller persisting the new bucket and the old envelopes.
+ *
+ * Nothing here is written by the library. Persisting the whole result
+ * atomically is the caller's obligation, and the caller is the only party that
+ * can — including incrementing `KeyGroup.generation`, which rotation does not
+ * receive and therefore cannot compute.
+ */
+export interface GroupRotation {
+  /** K1's new public half. Every future seal uses this. */
+  readonly publicKey: PublicKey;
+  /** K1's new private half, returned once. The bucket is its only durable copy. */
+  readonly privateKey: PrivateKey;
+  /** Every field of the group, resealed under the new public half. */
+  readonly fields: readonly SealedField[];
+  /** The rebuilt bucket: one entry per surviving API key, never empty. */
+  readonly bucket: readonly BucketEntry[];
 }
 
 // ---------------------------------------------------------------------------
@@ -195,27 +368,45 @@ export interface FieldDescriptor {
 // Bundle: read-in-place views
 // ---------------------------------------------------------------------------
 
+/*
+ * Every accessor below is a `readonly` function property rather than a method.
+ * A view is a window onto a buffer shared by every concurrent request in the
+ * isolate; replacing one of its accessors is never a legitimate act, and
+ * `readonly` says so at compile time. Implementations still write them as
+ * ordinary methods and callers still call them as ordinary methods.
+ *
+ * The byte views themselves stay `Uint8Array`: the bundle is mutated in place
+ * — that is the cache — and every one of these views is handed to Web Crypto,
+ * which takes a `BufferSource`. Immutability is enforced where it is true, and
+ * not claimed where it is not.
+ */
+
 /** One bucket entry, read in place. `wrapped()` returns a view, never a copy. */
 export interface BucketEntryView {
   readonly entryOffset: number;
-  keyIdBytes(): Uint8Array;
-  keyIdHex(): string;
-  wrapped(): Uint8Array;
+  readonly keyIdBytes: () => Uint8Array;
+  readonly keyIdHex: () => string;
+  readonly wrapped: () => Uint8Array;
 }
 
 /** One key group, read in place. */
 export interface KeyGroupView {
   readonly groupIndex: number;
   readonly recordOffset: number;
-  groupIdBytes(): Uint8Array;
-  groupId(): string;
-  publicKey(): Uint8Array;
-  generation(): number;
+  readonly groupIdBytes: () => Uint8Array;
+  readonly groupId: () => string;
+  readonly publicKey: () => PublicKey;
+  readonly generation: () => number;
   readonly bucketSize: number;
-  bucketEntry(index: number): BucketEntryView | undefined;
-  findBucketEntry(keyId: string): BucketEntryView | undefined;
-  /** The descriptor for K1's wrapped private half, cached the same way a field is. */
-  privateKeyDescriptor(): FieldDescriptor;
+  readonly bucketEntry: (index: number) => BucketEntryView | undefined;
+  readonly findBucketEntry: (keyId: string) => BucketEntryView | undefined;
+  /**
+   * The descriptor for K1's wrapped private half, cached the same way a field
+   * is. Its scratch region is sized to the group's widest bucket entry and is
+   * never itself a bucket entry — writing an unwrapped half into an entry would
+   * destroy the wrap another API key needs.
+   */
+  readonly privateKeyDescriptor: () => FieldDescriptor;
 }
 
 /**
@@ -228,30 +419,31 @@ export interface ConnectionRecord {
   readonly recordOffset: number;
   readonly groupIndex: number;
   /** A 16-byte view over the record's UUID. */
-  idBytes(): Uint8Array;
+  readonly idBytes: () => Uint8Array;
   /** Full sixteen-byte comparison; the index fingerprint is a filter, not a proof. */
-  matchesId(id: Uint8Array): boolean;
-  target(): string;
-  visibleKeys(): readonly string[];
-  visible(name: string): string | number | boolean | undefined;
+  readonly matchesId: (id: Uint8Array) => boolean;
+  readonly target: () => string;
+  readonly visibleKeys: () => readonly string[];
+  /** First match wins, and the walk stops there; duplicate keys are not rejected. */
+  readonly visible: (name: string) => string | number | boolean | undefined;
   /** Unix millis, or `null` when the connection does not expire. */
-  expiresAt(): number | null;
+  readonly expiresAt: () => number | null;
   /** Indices into the FILT section. */
-  filterIndices(): Uint32Array;
-  fieldNames(): readonly string[];
-  field(name: string): FieldDescriptor | undefined;
+  readonly filterIndices: () => Uint32Array;
+  readonly fieldNames: () => readonly string[];
+  readonly field: (name: string) => FieldDescriptor | undefined;
   /**
    * The current bytes of a field: the envelope while `state === Sealed`, the
    * plaintext once it is `Open`. A view into the buffer, never a copy.
    */
-  fieldBytes(descriptor: FieldDescriptor): Uint8Array;
+  readonly fieldBytes: (descriptor: FieldDescriptor) => Uint8Array;
 }
 
 /** A filter's constructor arguments, read at call time and never instantiated. */
 export interface FilterArgsView {
   readonly filterIndex: number;
   readonly kind: number;
-  args(): Uint8Array;
+  readonly args: () => Uint8Array;
 }
 
 /**
@@ -262,23 +454,31 @@ export interface BundleView {
   readonly header: BundleHeader;
   /** The buffer being read. Held so a write-back lands where the read started. */
   readonly buffer: Uint8Array;
-  section(kind: SectionKindName): SectionEntry | undefined;
+  readonly section: (kind: SectionKindName) => SectionEntry | undefined;
   /** Verified once at load, and never again: write-back invalidates it by design. */
-  verifyChecksum(): Promise<boolean>;
+  readonly verifyChecksum: () => Promise<boolean>;
   readonly connectionCount: number;
   readonly groupCount: number;
-  /** One masked slot read, a fingerprint compare, then a full id verify. */
-  lookup(connectionId: string): ConnectionRecord | undefined;
-  connectionAt(recordOffset: number): ConnectionRecord;
-  group(index: number): KeyGroupView | undefined;
-  groupById(groupId: string): KeyGroupView | undefined;
-  filter(index: number): FilterArgsView | undefined;
+  /**
+   * One masked slot read, a fingerprint compare, then a full id verify.
+   *
+   * A miss is one read and a hit is a read plus cryptography, so the difference
+   * is observable. Closing that oracle is `component/shard`'s duty on **every**
+   * miss path — malformed id, wrong shard prefix, empty slot, fingerprint
+   * mismatch alike — because lookup is synchronous and cannot perform the decoy
+   * itself. The library offers `decoyUnwrap`; it cannot make a caller run it.
+   */
+  readonly lookup: (connectionId: string) => ConnectionRecord | undefined;
+  readonly connectionAt: (recordOffset: number) => ConnectionRecord;
+  readonly group: (index: number) => KeyGroupView | undefined;
+  readonly groupById: (groupId: string) => KeyGroupView | undefined;
+  readonly filter: (index: number) => FilterArgsView | undefined;
   /**
    * Write plaintext into the slot its own ciphertext occupied: bytes, then
    * `plain_len`, then `state` — in one synchronous block, flag published last.
    * An envelope is always exactly 60 bytes larger than its plaintext, so it fits.
    */
-  writeBack(descriptor: FieldDescriptor, plaintext: Uint8Array): FieldDescriptor;
+  readonly writeBack: (descriptor: FieldDescriptor, plaintext: Uint8Array) => FieldDescriptor;
 }
 
 // ---------------------------------------------------------------------------
@@ -337,7 +537,11 @@ export class VaultError extends Error {
   }
 }
 
-/** A display string is not a well-formed API key. Carries the machine reason. */
+/**
+ * A display string is not a well-formed API key. Carries the machine reason.
+ *
+ * Thrown only by `requireApiKey`. `parseKey` returns a result and never throws.
+ */
 export class ApiKeyFormatError extends VaultError {
   readonly reason: ApiKeyParseFailure;
   constructor(reason: ApiKeyParseFailure, message: string) {
@@ -361,6 +565,13 @@ export class EnvelopeFormatError extends VaultError {
  * Deliberately one error for wrong key, wrong group, wrong AAD and corrupted
  * bytes: the relay must not become an enumeration oracle, so the library does
  * not hand a caller the distinction it would need to build one.
+ *
+ * `adr/0012-tenant-held-keys` scopes that narrowly, and the narrow statement is
+ * the true one: a library may distinguish a malformed envelope from a failed
+ * tag, and should, because somebody debugging a corrupt bundle needs it. What
+ * must be indistinguishable is what a caller of the *relay* observes — one
+ * status, one body, one timing envelope — and collapsing that wider set of
+ * outcomes is `component/shard`'s obligation, not this type's.
  */
 export class VaultDecryptionError extends VaultError {
   constructor(message = "decryption failed") {

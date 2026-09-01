@@ -14,12 +14,18 @@
  * `layout.ts` fixes every fixed-width record. It does not fix the three packed
  * blobs those records point at, so they are written down here, once:
  *
- * - **visible map** — `VISIBLE_OFFSET .. +VISIBLE_LENGTH`, a run of entries:
- *   `type u8 | key_len u16 | key utf8 | value`, where the value is
- *   `len u32 || utf8` for type 0, a `float64` for type 1, and a `u8` for type 2.
+ * - **visible map** — `VISIBLE_OFFSET .. +VISIBLE_LENGTH`, a run of entries with
+ *   no count, each `type u8 | key_len u16 | key utf8 | value`, where the value
+ *   is `len u32 || utf8` for type 0, a `float64` for type 1, and a `u8` for
+ *   type 2 (any non-zero byte is true).
  *   A packed scan of a handful of entries, rather than JSON, because the shard
  *   routes and refuses on this before touching any secret — a `JSON.parse` per
  *   request is exactly the per-record allocation the format exists to avoid.
+ *   Entry order is the writer's and carries no meaning; duplicate keys are not
+ *   rejected and **first match wins**, so a lookup stops at the first match.
+ *   A key is resolved by comparing **bytes**: decoding every key of every entry
+ *   would allocate a string per entry on the routing path — the path a refused
+ *   call takes too — which is the deserialisation this format exists to avoid.
  * - **field names** — `FIELD_NAMES_OFFSET`, `FIELD_COUNT` entries of
  *   `name_len u16 | name utf8`, positionally matching the record's descriptors.
  * - **filter indices** — `FILTERS_OFFSET`, `FILTERS_COUNT` little-endian `u32`.
@@ -31,7 +37,9 @@
  */
 
 import { hexDecode, hexEncode, timingSafeEqual, utf8Decode, utf8Encode } from "../encoding.js";
+import { bucketAssociatedData } from "../envelope.js";
 import {
+  asPublicKey,
   type BucketEntryView,
   BundleFormatError,
   type BundleHeader,
@@ -55,15 +63,19 @@ import {
   bucketOf,
   CHECKSUM_ALGORITHM,
   CHECKSUM_BYTES,
+  CONN_MAX_FIELDS,
   CONN_OFFSET,
   CONN_RECORD_BYTES,
   CONNECTION_ID_BYTES,
+  connRecordOffset,
   FIELD_DESCRIPTOR_BYTES,
   FIELD_DESCRIPTOR_OFFSET,
+  FILT_ENTRY_BYTES,
   FILT_ENTRY_OFFSET,
   fieldDescriptorOffset,
   filtEntryOffset,
   GRUP_OFFSET,
+  GRUP_RECORD_BYTES,
   grupRecordOffset,
   HEADER_BYTES,
   HEADER_OFFSET,
@@ -94,6 +106,23 @@ const VISIBLE_TYPE = {
 /** K1's public half, in the clear. */
 const PUBLIC_KEY_BYTES = 32;
 
+/**
+ * One `visible` entry, located but not decoded.
+ *
+ * Offsets and lengths only: a walk that handed over a decoded key and value
+ * would have allocated both before the caller could say it wanted neither.
+ */
+interface VisibleEntry {
+  readonly type: number;
+  readonly keyOffset: number;
+  readonly keyLength: number;
+  readonly valueOffset: number;
+  readonly valueLength: number;
+}
+
+/** Return `true` to stop the walk at this entry. */
+type VisibleVisitor = (entry: VisibleEntry) => boolean;
+
 /** A group id is a UUID, and `groupById` accepts only its canonical form. */
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -122,7 +151,17 @@ function need(cursor: number, bytesNeeded: number, end: number, what: string): v
   }
 }
 
-/** Read one field descriptor in place. */
+/**
+ * Read one field descriptor in place.
+ *
+ * `plain_len` is bounded by `sealed_len`, and that bound is a disclosure
+ * control rather than a tidiness check. A field's slot is exactly as wide as
+ * the envelope that was published into it; the plaintext is always smaller, by
+ * 60 bytes. A `plain_len` larger than `sealed_len` therefore names bytes that
+ * belong to whatever the arena placed next — in a resident buffer, very
+ * plausibly another connection's opened plaintext — and `fieldBytes` would hand
+ * them back as this field's secret.
+ */
 export function readFieldDescriptor(buffer: Uint8Array, descriptorOffset: number): FieldDescriptor {
   if (
     !Number.isInteger(descriptorOffset) ||
@@ -136,11 +175,18 @@ export function readFieldDescriptor(buffer: Uint8Array, descriptorOffset: number
   if (state !== FieldState.Sealed && state !== FieldState.Open) {
     throw new BundleFormatError(`a field descriptor's state is 0 or 1, got ${state}`);
   }
+  const sealedLen = view.getUint32(descriptorOffset + FIELD_DESCRIPTOR_OFFSET.SEALED_LEN, true);
+  const plainLen = view.getUint32(descriptorOffset + FIELD_DESCRIPTOR_OFFSET.PLAIN_LEN, true);
+  if (plainLen > sealedLen) {
+    throw new BundleFormatError(
+      `a field's plaintext of ${plainLen} bytes cannot live in its ${sealedLen}-byte slot`,
+    );
+  }
   return {
     descriptorOffset,
     strsOffset: view.getUint32(descriptorOffset + FIELD_DESCRIPTOR_OFFSET.STRS_OFFSET, true),
-    sealedLen: view.getUint32(descriptorOffset + FIELD_DESCRIPTOR_OFFSET.SEALED_LEN, true),
-    plainLen: view.getUint32(descriptorOffset + FIELD_DESCRIPTOR_OFFSET.PLAIN_LEN, true),
+    sealedLen,
+    plainLen,
     state,
   };
 }
@@ -234,10 +280,35 @@ export function zeroTail(buffer: Uint8Array, length: number): void {
 
 /** Fixed decoy material, so the decoy costs the same on every miss. */
 const DECOY_KEY_MATERIAL = new Uint8Array(32).fill(0x5a);
-const DECOY_SALT = new Uint8Array(16).fill(0xa5);
-const DECOY_INFO = utf8Encode("socket0/v1/tmk-wrap");
+/** A real salt is `utf8(tenant_id)`; a UUID is what a tenant id looks like. */
+const DECOY_TENANT_ID = "5a5a5a5a-5a5a-5a5a-5a5a-5a5a5a5a5a5a";
+const DECOY_GROUP_ID = "a5a5a5a5-a5a5-a5a5-a5a5-a5a5a5a5a5a5";
+/** The two info strings a real bucket derivation uses, and their two lengths. */
+const HKDF_INFO_KEY_ID = "socket0/v1/key-id";
+const HKDF_INFO_WRAP_KEY = "socket0/v1/tmk-wrap";
+const KEY_ID_DERIVED_BYTES = 16;
+const WRAP_KEY_BYTES = 32;
 /** `nonce(12) || ciphertext(32) || tag(16)`, the shape of a real bucket entry. */
 const DECOY_ENTRY = new Uint8Array(60);
+const WRAP_NONCE_BYTES = 12;
+
+/** HKDF-SHA256 over the decoy material, the shape `api-key.ts` derives with. */
+async function decoyDerive(info: string, byteLength: number): Promise<Uint8Array<ArrayBuffer>> {
+  const material = await crypto.subtle.importKey("raw", DECOY_KEY_MATERIAL, "HKDF", false, [
+    "deriveBits",
+  ]);
+  const bits = await crypto.subtle.deriveBits(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: utf8Encode(DECOY_TENANT_ID),
+      info: utf8Encode(info),
+    },
+    material,
+    byteLength * 8,
+  );
+  return new Uint8Array(bits);
+}
 
 /**
  * Perform a dummy unwrap against a fixed decoy group.
@@ -247,25 +318,35 @@ const DECOY_ENTRY = new Uint8Array(60);
  * promises every pre-relay refusal is indistinguishable, and that promise has
  * to cover elapsed time. Roughly 0.03 ms, on a path that is already refusing.
  *
- * It derives *and* decrypts, because a real unwrap does both and a decoy that
- * skipped the derivation would leave half the difference measurable.
+ * **It mirrors a real unwrap operation for operation**, because approximate is
+ * not good enough here. A real unwrap derives *two* values — the key id and the
+ * wrap key, under different info strings and to different lengths — imports the
+ * wrap key, and decrypts the entry under associated data built from the group
+ * id and the derived key id. A decoy that derived once and decrypted measured
+ * about 12% short, and short in the same direction every time, which is the
+ * worst shape a timing signal can have: a systematic bias is separable from
+ * noise by averaging, so repeating the probe recovers the answer the decoy was
+ * there to hide. The two derivations run concurrently exactly as `group.ts`
+ * runs them, so the decoy's latency is the real path's latency and not its
+ * total work.
  */
 export async function decoyUnwrap(): Promise<void> {
-  const material = await crypto.subtle.importKey("raw", DECOY_KEY_MATERIAL, "HKDF", false, [
-    "deriveKey",
+  const [keyId, wrapKey] = await Promise.all([
+    decoyDerive(HKDF_INFO_KEY_ID, KEY_ID_DERIVED_BYTES),
+    decoyDerive(HKDF_INFO_WRAP_KEY, WRAP_KEY_BYTES),
   ]);
-  const wrapKey = await crypto.subtle.deriveKey(
-    { name: "HKDF", hash: "SHA-256", salt: DECOY_SALT, info: DECOY_INFO },
-    material,
-    { name: "AES-GCM", length: 256 },
-    false,
-    ["decrypt"],
-  );
+  const key = await crypto.subtle.importKey("raw", wrapKey, { name: "AES-GCM" }, false, [
+    "decrypt",
+  ]);
   try {
     await crypto.subtle.decrypt(
-      { name: "AES-GCM", iv: DECOY_ENTRY.subarray(0, 12) },
-      wrapKey,
-      DECOY_ENTRY.subarray(12),
+      {
+        name: "AES-GCM",
+        iv: DECOY_ENTRY.subarray(0, WRAP_NONCE_BYTES),
+        additionalData: copyOf(bucketAssociatedData(DECOY_GROUP_ID, hexEncode(keyId))),
+      },
+      key,
+      DECOY_ENTRY.subarray(WRAP_NONCE_BYTES),
     );
   } catch {
     // Always fails, by construction. Spending the time is the entire point.
@@ -284,8 +365,9 @@ export async function decoyUnwrap(): Promise<void> {
  *
  * @param buffer the bundle. Held by reference — the view reads and writes back
  *   into these exact bytes.
- * @throws {BundleFormatError} on a bad magic, a truncated header, or a section
- *   table that points outside the buffer.
+ * @throws {BundleFormatError} on a bad magic, a truncated header, a missing
+ *   required section, a section table that points outside the buffer, or a
+ *   field that arrives already open.
  * @throws {UnsupportedBundleVersionError} on a version this reader does not
  *   know. Refuse the whole bundle and keep serving the previous generation:
  *   partial understanding of a security artifact is worse than none.
@@ -297,14 +379,20 @@ export function readBundle(buffer: Uint8Array | ArrayBuffer): BundleView {
   const header = readHeader(bytes, view);
   const sections = readSectionTable(bytes, view, header.sections);
 
-  const indx = sections.get(SECTION_KIND.INDX);
-  const conn = sections.get(SECTION_KIND.CONN);
-  const grup = sections.get(SECTION_KIND.GRUP);
-  const filt = sections.get(SECTION_KIND.FILT);
+  const indx = requiredSection(sections, "INDX");
+  const conn = requiredSection(sections, "CONN");
+  const grup = requiredSection(sections, "GRUP");
+  const filt = requiredSection(sections, "FILT");
+
+  assertSectionHolds(conn, CONN_RECORD_BYTES, "CONN");
+  assertSectionHolds(grup, GRUP_RECORD_BYTES, "GRUP");
+  assertSectionHolds(filt, FILT_ENTRY_BYTES, "FILT");
 
   const slots = indexSlots(indx);
-  const connectionCount = conn?.count ?? 0;
-  const groupCount = grup?.count ?? 0;
+  const connectionCount = conn.count;
+  const groupCount = grup.count;
+
+  assertEntirelySealed(bytes, view, conn, grup);
 
   // ---- shared primitives ------------------------------------------------
 
@@ -333,12 +421,16 @@ export function readBundle(buffer: Uint8Array | ArrayBuffer): BundleView {
    * A linear scan, deliberately: the map holds a handful of routing hints, and a
    * per-record hash table would cost more to build at publish time than a scan
    * this short could ever save.
+   *
+   * **Nothing is decoded here.** `visit` is handed the offsets and lengths of
+   * the key and the value and decides what, if anything, is worth turning into
+   * a JavaScript value. The map is read on the routing path — the path a
+   * refused call takes as well — so decoding every key of every entry in order
+   * to compare it would allocate a string per entry, per request, to throw all
+   * but one of them away. That is the deserialisation this format exists to
+   * avoid, and it is why `visible` compares bytes instead.
    */
-  function walkVisible(
-    start: number,
-    length: number,
-    visit: (key: string, value: VisibleValue) => boolean,
-  ): void {
+  function walkVisible(start: number, length: number, visit: VisibleVisitor): void {
     slice(start, length, "the visible map");
     const end = start + length;
     let cursor = start;
@@ -349,33 +441,60 @@ export function readBundle(buffer: Uint8Array | ArrayBuffer): BundleView {
       const keyLength = view.getUint16(cursor + 1, true);
       cursor += 3;
       need(cursor, keyLength, end, "a visible key");
-      const key = text(cursor, keyLength, "a visible key");
+      const keyOffset = cursor;
       cursor += keyLength;
 
-      let value: VisibleValue;
+      let valueOffset = cursor;
+      let valueLength: number;
       if (type === VISIBLE_TYPE.String) {
         need(cursor, 4, end, "a visible string's length");
-        const valueLength = view.getUint32(cursor, true);
+        valueLength = view.getUint32(cursor, true);
         cursor += 4;
+        valueOffset = cursor;
         need(cursor, valueLength, end, "a visible string");
-        value = text(cursor, valueLength, "a visible string");
         cursor += valueLength;
       } else if (type === VISIBLE_TYPE.Number) {
         need(cursor, 8, end, "a visible number");
-        value = view.getFloat64(cursor, true);
+        valueLength = 8;
         cursor += 8;
       } else if (type === VISIBLE_TYPE.Boolean) {
         need(cursor, 1, end, "a visible boolean");
-        value = view.getUint8(cursor) !== 0;
+        valueLength = 1;
         cursor += 1;
       } else {
         throw new BundleFormatError(`unknown visible value type ${type}`);
       }
 
-      if (visit(key, value)) {
+      if (visit({ type, keyOffset, keyLength, valueOffset, valueLength })) {
         return;
       }
     }
+  }
+
+  /** Compare a key in place with the bytes wanted, without decoding either. */
+  function keyIs(entry: VisibleEntry, wanted: Uint8Array): boolean {
+    if (entry.keyLength !== wanted.byteLength) {
+      return false;
+    }
+    for (let i = 0; i < entry.keyLength; i += 1) {
+      if (view.getUint8(entry.keyOffset + i) !== wanted[i]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** Decode one entry's value. Called for the one entry that was asked for. */
+  function visibleValueOf(entry: VisibleEntry): VisibleValue {
+    if (entry.type === VISIBLE_TYPE.String) {
+      return text(entry.valueOffset, entry.valueLength, "a visible string");
+    }
+    if (entry.type === VISIBLE_TYPE.Number) {
+      return view.getFloat64(entry.valueOffset, true);
+    }
+    // The walk rejects every other type, so this is the boolean case. Any
+    // non-zero byte is true.
+    return view.getUint8(entry.valueOffset) !== 0;
   }
 
   // ---- field names ------------------------------------------------------
@@ -402,9 +521,8 @@ export function readBundle(buffer: Uint8Array | ArrayBuffer): BundleView {
   // ---- connection records -----------------------------------------------
 
   function assertConnRecordOffset(recordOffset: number): void {
-    const start = conn?.offset ?? 0;
+    const start = conn.offset;
     const addressable =
-      conn !== undefined &&
       recordOffset >= start &&
       recordOffset + CONN_RECORD_BYTES <= start + conn.length &&
       (recordOffset - start) % CONN_RECORD_BYTES === 0;
@@ -447,29 +565,35 @@ export function readBundle(buffer: Uint8Array | ArrayBuffer): BundleView {
           "the target",
         ),
 
+      // The one caller that legitimately decodes every key, because every key
+      // is what it was asked for.
       visibleKeys: () => {
         const keys: string[] = [];
         walkVisible(
           view.getUint32(recordOffset + CONN_OFFSET.VISIBLE_OFFSET, true),
           view.getUint32(recordOffset + CONN_OFFSET.VISIBLE_LENGTH, true),
-          (key) => {
-            keys.push(key);
+          (entry) => {
+            keys.push(text(entry.keyOffset, entry.keyLength, "a visible key"));
             return false;
           },
         );
         return keys;
       },
 
+      // One encode of the name asked for, then byte comparisons in place: no
+      // key is decoded and no value but the matching one. First match wins and
+      // the walk stops there — duplicate keys are legal and not rejected.
       visible: (name: string): VisibleValue | undefined => {
+        const wanted = utf8Encode(name);
         let found: VisibleValue | undefined;
         walkVisible(
           view.getUint32(recordOffset + CONN_OFFSET.VISIBLE_OFFSET, true),
           view.getUint32(recordOffset + CONN_OFFSET.VISIBLE_LENGTH, true),
-          (key, value) => {
-            if (key !== name) {
+          (entry) => {
+            if (!keyIs(entry, wanted)) {
               return false;
             }
-            found = value;
+            found = visibleValueOf(entry);
             return true;
           },
         );
@@ -555,7 +679,7 @@ export function readBundle(buffer: Uint8Array | ArrayBuffer): BundleView {
   }
 
   function group(index: number): KeyGroupView | undefined {
-    if (grup === undefined || !Number.isInteger(index) || index < 0 || index >= groupCount) {
+    if (!Number.isInteger(index) || index < 0 || index >= groupCount) {
       return undefined;
     }
     const recordOffset = grupRecordOffset(grup.offset, index);
@@ -570,8 +694,12 @@ export function readBundle(buffer: Uint8Array | ArrayBuffer): BundleView {
       bucketSize,
       groupIdBytes,
       groupId: () => formatUuid(groupIdBytes()),
+      // Branded in place, never copied: `asPublicKey` only asserts the length,
+      // and the slice is exactly the group's 32 bytes where they lie.
       publicKey: () =>
-        slice(recordOffset + GRUP_OFFSET.PUBLIC_KEY, PUBLIC_KEY_BYTES, "a public half"),
+        asPublicKey(
+          slice(recordOffset + GRUP_OFFSET.PUBLIC_KEY, PUBLIC_KEY_BYTES, "a public half"),
+        ),
       generation: () => view.getUint32(recordOffset + GRUP_OFFSET.GENERATION, true),
       bucketEntry: (entryIndex: number): BucketEntryView | undefined =>
         Number.isInteger(entryIndex) && entryIndex >= 0 && entryIndex < bucketSize
@@ -611,7 +739,7 @@ export function readBundle(buffer: Uint8Array | ArrayBuffer): BundleView {
   }
 
   function filter(index: number): FilterArgsView | undefined {
-    if (filt === undefined || !Number.isInteger(index) || index < 0 || index >= filt.count) {
+    if (!Number.isInteger(index) || index < 0 || index >= filt.count) {
       return undefined;
     }
     const entryOffset = filtEntryOffset(filt.offset, index);
@@ -636,9 +764,6 @@ export function readBundle(buffer: Uint8Array | ArrayBuffer): BundleView {
    * which is what makes a miss cost one read.
    */
   function lookup(connectionId: string): ConnectionRecord | undefined {
-    if (indx === undefined || conn === undefined) {
-      return undefined;
-    }
     const id = tryParseConnectionId(connectionId);
     // An id names both the shard and the connection, so another shard's id
     // cannot be here and saying so costs nothing.
@@ -785,11 +910,99 @@ function readSectionTable(
   return sections;
 }
 
-/** The slot count implied by the INDX section, validated once, at load. */
-function indexSlots(indx: SectionEntry | undefined): number {
-  if (indx === undefined) {
-    return 0;
+/**
+ * Fetch a section `bundle/schema.json` lists as required, or refuse the bundle.
+ *
+ * The schema requires `header`, `index`, `groups`, `connections` and `filters`,
+ * and a reader that quietly served a bundle missing one would be serving a
+ * different artifact than the one the format describes: an absent INDX turns
+ * every lookup into a miss and an absent GRUP turns every connection into one
+ * whose key group cannot be found — refusals that look exactly like a correct
+ * answer and would have the shard keep serving a bundle it should have
+ * rejected in favour of the previous generation. Present-and-empty is a
+ * different statement from absent, and remains legal.
+ */
+function requiredSection(sections: Map<number, SectionEntry>, kind: SectionKindName): SectionEntry {
+  const entry = sections.get(SECTION_KIND[kind]);
+  if (entry === undefined) {
+    throw new BundleFormatError(`a bundle must carry a ${kind} section`);
   }
+  return entry;
+}
+
+/**
+ * A section's record count must fit the bytes the section actually holds.
+ *
+ * `count` and `length` are two independent uint32 out of the same table, and
+ * every walk below is driven by `count`. Left unchecked, a count larger than
+ * the section reads the section that follows it as records of this one's shape.
+ */
+function assertSectionHolds(entry: SectionEntry, recordBytes: number, kind: string): void {
+  if (entry.count * recordBytes > entry.length) {
+    throw new BundleFormatError(
+      `section ${kind} claims ${entry.count} records but holds only ${entry.length} bytes`,
+    );
+  }
+}
+
+/**
+ * A freshly loaded bundle is **entirely sealed**, and this enforces it.
+ *
+ * The catalog states it as a property of a refresh: the new buffer is entirely
+ * sealed and every connection unseals once more. It is also the reader's only
+ * defence against the cheapest attack on the format. The checksum is unkeyed
+ * and therefore forgeable by anyone who can write to the store, so an attacker
+ * with that access can overwrite a field's arena slot with bytes of their
+ * choosing, set `plain_len`, set `state` to `1`, and re-stamp a valid checksum.
+ * The field then reads back as attacker-chosen plaintext with **no
+ * cryptography executed at all** — the open path is skipped entirely, because
+ * the whole point of `state == 1` is that there is nothing left to do.
+ *
+ * Sealing is the property that makes a forged bundle able to misroute a call
+ * but not to produce a credential, and it only holds if `state == 0` and
+ * `plain_len == 0` are checked before the cache is trusted.
+ */
+function assertEntirelySealed(
+  bytes: Uint8Array,
+  view: DataView,
+  conn: SectionEntry,
+  grup: SectionEntry,
+): void {
+  for (let index = 0; index < conn.count; index += 1) {
+    const recordOffset = connRecordOffset(conn.offset, index);
+    const fieldCount = view.getUint32(recordOffset + CONN_OFFSET.FIELD_COUNT, true);
+    if (fieldCount > CONN_MAX_FIELDS) {
+      throw new BundleFormatError(
+        `a connection record holds at most ${CONN_MAX_FIELDS} fields, got ${fieldCount}`,
+      );
+    }
+    for (let field = 0; field < fieldCount; field += 1) {
+      assertSealed(
+        readFieldDescriptor(bytes, fieldDescriptorOffset(recordOffset, field)),
+        `field ${field} of the connection at ${recordOffset}`,
+      );
+    }
+  }
+
+  for (let index = 0; index < grup.count; index += 1) {
+    assertSealed(
+      readFieldDescriptor(
+        bytes,
+        grupRecordOffset(grup.offset, index) + GRUP_OFFSET.PRIVATE_DESCRIPTOR,
+      ),
+      `the private half of group ${index}`,
+    );
+  }
+}
+
+function assertSealed(descriptor: FieldDescriptor, what: string): void {
+  if (descriptor.state !== FieldState.Sealed || descriptor.plainLen !== 0) {
+    throw new BundleFormatError(`${what} arrives open; a freshly loaded bundle is entirely sealed`);
+  }
+}
+
+/** The slot count implied by the INDX section, validated once, at load. */
+function indexSlots(indx: SectionEntry): number {
   if (indx.length % INDEX_SLOT_BYTES !== 0) {
     throw new BundleFormatError(
       `the index is not a whole number of ${INDEX_SLOT_BYTES}-byte slots`,
@@ -850,6 +1063,20 @@ function unshared(bytes: Uint8Array, from: number): Uint8Array<ArrayBuffer> {
     throw new BundleFormatError("a bundle cannot be read from a SharedArrayBuffer");
   }
   return new Uint8Array(buffer, bytes.byteOffset + from, bytes.byteLength - from);
+}
+
+/**
+ * Copy a few dozen bytes into an `ArrayBuffer`-backed view.
+ *
+ * Web Crypto's `BufferSource` excludes `SharedArrayBuffer`, and a plain
+ * `Uint8Array` cannot prove it is not backed by one. Only the decoy's
+ * associated data goes through here, so the copy is free and the alternative
+ * would be a cast.
+ */
+function copyOf(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  return copy;
 }
 
 /** Canonical 8-4-4-4-12. */

@@ -20,16 +20,46 @@ metaframework catalog under `solutions/socket0`:
 | Document | What it fixes |
 |---|---|
 | `product/vault-sdk/index.md` | why this package exists and what it owns |
-| `product/vault-sdk/component/sealing/index.md` | the four operations and the asymmetry in them |
+| `product/vault-sdk/component/sealing/index.md` | the operations and the asymmetry in them |
 | `datamodel/api-key/index.md` | the key format and the two derivations |
 | `datamodel/sealed-secret/construction.md` | the envelope, exactly |
 | `product/vault-sdk/datamodel/bundle/index.md` | the binary layout, the index, the write-back cache |
 | `product/vault-sdk/datamodel/bundle/schema.json` | what that layout encodes, logically |
-| `protocol/vault-operations/` | the exported surface |
+| `protocol/vault-operations/` | the ten operations that are the contract |
 | `.../tenant/datamodel/key-group/index.md` | what a key group is and bounds |
 
 When the code and the catalog disagree, the catalog is right and the code is a defect.
 Change the catalog first.
+
+## The surface
+
+`protocol/vault-operations` names **ten** operations, and `transport.yaml` lists the same
+ten and nothing else. They are exported from `src/index.ts` under exactly those names:
+
+| Operation | Needs a secret |
+|---|---|
+| `generateGroup()` | no |
+| `seal(value, groupPublicKey, aad)` | **no** |
+| `open(envelope, k1Private, aad)` | yes — K1 private |
+| `wrap(k1Private, apiKey, tenantId, groupId)` | yes — an API key |
+| `unwrap(entry, apiKey, tenantId, groupId)` | yes — an API key |
+| `deriveKeyId(apiKey, tenantId)` | yes — an API key |
+| `parseKey(display)` | no |
+| `rotateGroup(oldPriv, fields, apiKeys, tenantId, groupId)` | yes — an API key |
+| `writeBundle(input)` | no |
+| `readBundle(buffer)` | no |
+
+**That table is the contract.** The package exports more than it — encoders, parsers,
+layout constants, branded-type constructors, the error taxonomy — and everything past the
+`IMPLEMENTATION` divider in `src/index.ts` is exactly that: reachable by a consumer, not
+contract. It may change without the protocol version changing, and no other component may
+depend on it.
+
+**Rotation is one operation, not a recipe.** `rotateGroup` returns the new public half, the
+resealed fields and the rebuilt bucket **together or not at all**, because a partial write
+leaves fields no surviving key can open and there is no recovery path. It writes nothing;
+persisting the whole result atomically is the caller's job, and the caller is the only party
+that can.
 
 ## Invariants
 
@@ -44,15 +74,34 @@ info="socket0/v1", 32)`.
 package that seals with a private half, and a reviewer confirms that property by reading
 the signature rather than the implementation.
 
-**The associated data binds identity.** A credential field binds `connection_id ||
-field_name`; a bucket entry binds `group_id || key_id`. An envelope moved between fields or
-between connections fails to open even for a holder of the right key, so a writer that is
-compromised can replace a credential but cannot promote one.
+**The associated data binds identity, and it is length-prefixed.**
+
+    AAD(a, b, ...) = u32be(len(utf8(a))) || utf8(a) || u32be(len(utf8(b))) || utf8(b) || ...
+
+A credential field binds `AAD(connection_id, field_name)`; a bucket entry binds
+`AAD(group_id, key_id)`. An envelope moved between fields or between connections fails to
+open even for a holder of the right key, so a writer that is compromised can replace a
+credential but cannot promote one.
+
+**Plain concatenation is a defect and was one here.** `connection_id || field_name` makes
+`("conn", "1password")` and `("conn1", "password")` produce identical associated data, so an
+envelope sealed for one opens under the other. That was harmless only while every component
+happened to be fixed-width, which stops being true the moment a field name is tenant-chosen.
+Every component is length-prefixed with a big-endian `u32` over its UTF-8 bytes, and
+components are **never** canonicalised, trimmed or lower-cased: what is bound is the exact
+byte string the caller passed, so a mismatch fails rather than being silently repaired.
+Build one with `fieldAssociatedData` or `bucketAssociatedData` and with nothing else.
 
 **Two info strings over one secret, salted by the tenant id.**
 
-    key_id   = HKDF-SHA256(api_key, salt=tenant_id, info="socket0/v1/key-id",   16)
-    wrap_key = HKDF-SHA256(api_key, salt=tenant_id, info="socket0/v1/tmk-wrap", 32)
+    key_id   = HKDF-SHA256(api_key, salt=utf8(tenant_id), info="socket0/v1/key-id",   16)
+    wrap_key = HKDF-SHA256(api_key, salt=utf8(tenant_id), info="socket0/v1/tmk-wrap", 32)
+
+**SHA-256, and the salt is the tenant id's exact UTF-8 bytes, uncanonicalised.** A tenant id
+spelled with different case or hyphenation is a *different salt* and yields a key id that
+finds nothing and a wrap key that opens nothing — with no error at the point of the mistake.
+Canonicalising inside the derivation was rejected: it would silently repair a caller that is
+confused about identity, and identity confusion is the thing this salt exists to prevent.
 
 The salt is the **tenant id**, never the group's public half: the public half changes on
 every rotation and `key_id` must survive it, or bucket lookup breaks halfway through the
@@ -62,10 +111,24 @@ operation that rotates it.
 checksum are packaging; changing them must not invalidate a key that already exists.
 
 **The key display form is** `sk0_<live|test>_<43 chars base62 of the 32 bytes>_<6 chars
-base62 of the CRC-32>` — 59 characters. The checksum is verified locally, before any
-request, because a wrong key produces an authentication-tag failure that is deliberately
-indistinguishable from "wrong group", so the server can never tell a user they typed it
-wrong and the client must.
+base62 of the CRC-32>` — 59 characters. Base62 is `0-9A-Za-z` in that order and CRC-32 is
+the reflected IEEE polynomial `0xEDB88320`, `0xFFFFFFFF` init and final XOR. The checksum is
+verified locally, before any request, because a wrong key produces an authentication-tag
+failure that is deliberately indistinguishable from "wrong group", so the server can never
+tell a user they typed it wrong and the client must.
+
+**43 base62 characters encode more than 2^256**, so the parser refuses a body that decodes
+above `2^256 - 1` rather than truncating it. The display regex cannot express that bound.
+
+**`generateApiKey` is the only path from nothing to key material.** A key is never derived
+from a password, chosen or influenced by a user, shortened, or regenerated from anything
+reproducible, so no public renderer takes caller-supplied bytes.
+
+**A public half, a private half and an API key are distinct types.** All three are 32 raw
+bytes, so untyped they are mutually substitutable and `seal(value, pair.privateKey, aad)`
+type-checks, runs, and produces an envelope whose recipient is a public half nobody holds.
+`PublicKey`, `PrivateKey` and `ApiKeyBytes` are branded with `unique symbol` keys and are
+reachable only through `asPublicKey`, `asPrivateKey` and `asApiKeyBytes`.
 
 **The bundle is never deserialised.** It is read in place through a `DataView` at computed
 offsets. No object per record, no copy, no eager open.
@@ -75,6 +138,15 @@ slots of `fingerprint uint32 || CONN offset uint32`; `bucket = uuid_low32 & (slo
 `fingerprint = uuid_high32`; an offset of 0 means empty; linear probing on collision. **A
 fingerprint miss must not read the CONN section.** A candidate match still verifies all
 sixteen bytes of the id, because a 32-bit fingerprint is a filter and not a proof.
+
+**A freshly loaded bundle is entirely sealed, and `readBundle` enforces it.** Every CONN
+field descriptor and every GRUP private-half descriptor must read `state == 0` and
+`plain_len == 0`, and `plain_len` may never exceed `sealed_len`. The checksum is unkeyed and
+therefore forgeable by anyone who can write to the store, so without this check an attacker
+overwrites a field's arena slot with bytes of their choosing, sets `plain_len`, sets `state`
+to `1` and re-stamps a valid checksum — and the field reads back as attacker-chosen
+plaintext with no cryptography executed at all. Sealing at load is what keeps a forged
+bundle able to misroute a call but not to produce a credential.
 
 **The write-back cache is the transport format.** Opened plaintext is written into the slot
 its own ciphertext occupied — an envelope is always exactly 60 bytes larger than its
@@ -108,6 +180,7 @@ not be introduced to make a gate pass.
 
 ## Status
 
-Scaffold. Every module exports its full, typed signature; the bodies throw
-`not implemented`. `src/scaffold.test.ts` asserts exactly that and is meant to be dismantled
-module by module as the implementations land.
+Implemented, with `src/integration.test.ts` proving the modules against each other rather
+than against fixtures: real X25519 groups, real API keys, real HKDF, a bundle emitted by
+`writeBundle` and read back by `readBundle`, a real rotation, and the forged bundles the
+reader has to refuse.

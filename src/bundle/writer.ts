@@ -382,7 +382,12 @@ function planGroups(
         group.publicKey,
         GROUP_PUBLIC_KEY_BYTES,
       ),
-      generation: assertUint32(`key group ${group.groupId} generation`, group.generation ?? 0),
+      // `KeyGroup.generation` is required, never defaulted. An absent counter
+      // and a counter of zero are different claims and only the caller knows
+      // which it means; substituting zero here would let a caller who dropped
+      // the field publish a rotated group that reads as freshly minted, and
+      // `generation` is what decides stale from corrupt.
+      generation: assertUint32(`key group ${group.groupId} generation`, group.generation),
       bucketOffset: bucketCursor,
       bucket,
       // A dedicated scratch slot rather than one of the bucket entries: which

@@ -5,7 +5,7 @@
  *     shared     = X25519(eph.priv, group_pub)
  *     key        = HKDF-SHA256(ikm=shared, salt=eph.pub || group_pub, info="socket0/v1", 32)
  *     nonce      = random(12)
- *     ct || tag  = AES-256-GCM(key, nonce, plaintext, aad=connection_id || field_name)
+ *     ct || tag  = AES-256-GCM(key, nonce, plaintext, aad=AAD(connection_id, field_name))
  *     envelope   = "x25519-hkdf-aesgcm:" + b64(eph.pub || nonce || ct || tag)
  *
  * Web Crypto only — `globalThis.crypto.subtle`. No `node:crypto`, no wasm, no
@@ -17,8 +17,22 @@
  */
 
 import { base64Decode, base64Encode, utf8Encode } from "./encoding.js";
-import type { AssociatedData, EnvelopeParts, GroupKeyPair, SealedEnvelope } from "./types.js";
-import { EnvelopeFormatError, SEAL_ALGORITHM, VaultDecryptionError, VaultError } from "./types.js";
+import type {
+  AssociatedData,
+  EnvelopeParts,
+  GroupKeyPair,
+  PrivateKey,
+  PublicKey,
+  SealedEnvelope,
+} from "./types.js";
+import {
+  asPrivateKey,
+  asPublicKey,
+  EnvelopeFormatError,
+  SEAL_ALGORITHM,
+  VaultDecryptionError,
+  VaultError,
+} from "./types.js";
 
 /** `eph_pub`. */
 export const EPHEMERAL_PUBLIC_KEY_BYTES = 32;
@@ -37,6 +51,8 @@ export const ENVELOPE_OVERHEAD_BYTES = 60;
 export const HKDF_INFO_ENVELOPE = "socket0/v1";
 /** The X25519 base point, used to recover a public half from a private one. */
 export const X25519_BASE_POINT_BYTES = 32;
+/** Every associated-data component carries a big-endian `u32` length prefix. */
+export const AAD_LENGTH_PREFIX_BYTES = 4;
 
 // ---------------------------------------------------------------------------
 // Module-private constants
@@ -76,9 +92,6 @@ const X25519_BASE_POINT = Uint8Array.from({ length: X25519_BASE_POINT_BYTES }, (
 const PKCS8_X25519_PREFIX = Uint8Array.from([
   0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x04, 0x22, 0x04, 0x20,
 ]);
-
-/** Standard base64 with padding, and nothing else. */
-const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 /** An algorithm tag long enough to identify itself is short enough to quote. */
 const ALGORITHM_QUOTE_LIMIT = 32;
@@ -211,7 +224,7 @@ async function deriveContentKey(
 export async function generateX25519KeyPair(): Promise<GroupKeyPair> {
   // An X25519 private key is 32 uniform random bytes; clamping happens inside
   // the scalar multiplication, so there is no key-generation step to delegate.
-  const privateKey = randomBytes(X25519_KEY_BYTES);
+  const privateKey = asPrivateKey(randomBytes(X25519_KEY_BYTES));
   return { privateKey, publicKey: await derivePublicKey(privateKey) };
 }
 
@@ -219,26 +232,55 @@ export async function generateX25519KeyPair(): Promise<GroupKeyPair> {
  * Recover the public half of an X25519 private key, as `X25519(priv, basepoint)`.
  *
  * Needed because `open` must reconstruct the HKDF salt `eph.pub || group_pub`
- * and a caller may hold only the unwrapped private half. Pass the public half
- * to `open` explicitly on a hot path to skip this.
+ * and a caller may hold only the unwrapped private half.
  */
-export async function derivePublicKey(privateKey: Uint8Array): Promise<Uint8Array> {
-  return publicKeyOf(await importPrivateKey(privateKey));
+export async function derivePublicKey(privateKey: PrivateKey): Promise<PublicKey> {
+  return asPublicKey(await publicKeyOf(await importPrivateKey(privateKey)));
 }
 
 /**
- * Build the associated data for a credential field: `connection_id || field_name`.
+ * `AAD(a, b, ...) = u32be(len(utf8(a))) || utf8(a) || u32be(len(utf8(b))) || utf8(b) || ...`
+ *
+ * The length prefix is not decoration. Plain concatenation makes
+ * `("conn", "1password")` and `("conn1", "password")` produce identical
+ * associated data, so an envelope sealed for one opens under the other — and
+ * that stops being merely theoretical the moment a field name is tenant-chosen.
+ *
+ * Components are never canonicalised, trimmed or lower-cased: what is bound is
+ * the exact byte string the caller passed, so a mismatch fails rather than
+ * being silently repaired.
+ */
+function associatedData(...components: readonly string[]): AssociatedData {
+  const encoded = components.map(utf8Encode);
+  let total = 0;
+  for (const component of encoded) {
+    total += AAD_LENGTH_PREFIX_BYTES + component.length;
+  }
+  const joined = new Uint8Array(total);
+  const lengths = new DataView(joined.buffer);
+  let offset = 0;
+  for (const component of encoded) {
+    lengths.setUint32(offset, component.length, false);
+    offset += AAD_LENGTH_PREFIX_BYTES;
+    joined.set(component, offset);
+    offset += component.length;
+  }
+  return joined;
+}
+
+/**
+ * Build the associated data for a credential field: `AAD(connection_id, field_name)`.
  *
  * An envelope copied from one connection's row to another's, or from `password`
  * into `api_key`, fails to open.
  */
 export function fieldAssociatedData(connectionId: string, fieldName: string): AssociatedData {
-  return concatBytes(utf8Encode(connectionId), utf8Encode(fieldName));
+  return associatedData(connectionId, fieldName);
 }
 
-/** Build the associated data for a bucket entry: `group_id || key_id`. */
+/** Build the associated data for a bucket entry: `AAD(group_id, key_id)`. */
 export function bucketAssociatedData(groupId: string, keyId: string): AssociatedData {
-  return concatBytes(utf8Encode(groupId), utf8Encode(keyId));
+  return associatedData(groupId, keyId);
 }
 
 /**
@@ -253,7 +295,7 @@ export function bucketAssociatedData(groupId: string, keyId: string): Associated
  */
 export async function seal(
   plaintext: Uint8Array,
-  recipientPublicKey: Uint8Array,
+  recipientPublicKey: PublicKey,
   aad: AssociatedData,
 ): Promise<SealedEnvelope> {
   const recipient = await importPublicKey(recipientPublicKey);
@@ -279,19 +321,34 @@ export async function seal(
 /**
  * Open an envelope with K1's private half.
  *
+ * `protocol/vault-operations` spells this `open(envelope, k1Private, aad)`, and
+ * that is the whole contract. The fourth parameter is an optional accelerator,
+ * not part of it: `rotateGroup` opens every field in a group under one private
+ * half, and deriving that half's public half once instead of once per field
+ * turns N base-point multiplications into one. It is the only caller that has
+ * the public half to hand, and the only one for which it matters.
+ *
+ * A public half that does not match the private one produces a
+ * `VaultDecryptionError` rather than a distinct complaint — the salt is simply
+ * wrong, and the tag fails. That is why it stays optional and why no caller
+ * should pass it speculatively.
+ *
  * @param envelope the `<alg>:<base64>` string, or the raw payload bytes.
  * @param recipientPrivateKey K1's private half, 32 raw bytes.
- * @param aad the same binding the writer used.
- * @param recipientPublicKey K1's public half, if the caller has it. Supplied to
- *   skip the base-point derivation needed to rebuild the HKDF salt.
+ * @param aad the same binding the writer used — build it with
+ *   `fieldAssociatedData` or `bucketAssociatedData`.
+ * @param recipientPublicKey K1's public half, if the caller already derived it.
+ * @throws {EnvelopeFormatError} if the envelope is not `<alg>:<base64>` over a
+ *   payload of at least the 60-byte overhead.
+ * @throws {VaultError} if either half is not 32 raw bytes.
  * @throws {VaultDecryptionError} on any authentication failure — wrong key,
  *   wrong group, wrong AAD and corruption are deliberately indistinguishable.
  */
 export async function open(
   envelope: SealedEnvelope | string | Uint8Array,
-  recipientPrivateKey: Uint8Array,
+  recipientPrivateKey: PrivateKey,
   aad: AssociatedData,
-  recipientPublicKey?: Uint8Array,
+  recipientPublicKey?: PublicKey,
 ): Promise<Uint8Array> {
   const parts =
     envelope instanceof Uint8Array ? parseEnvelopeBytes(envelope) : parseEnvelope(envelope);
@@ -331,6 +388,12 @@ export async function open(
 /**
  * Split `<alg>:<base64>` into its parts, as views over one decoded payload.
  *
+ * Every failure that leaves this function is an `EnvelopeFormatError`,
+ * including the base64 decoder's own `RangeError`s. A caller handling the
+ * declared taxonomy must not also have to catch whatever a helper happens to
+ * throw — a stray `RangeError` reaching a shard is an unhandled rejection, not
+ * a refusal.
+ *
  * @throws {EnvelopeFormatError} on a wrong algorithm, bad base64, or a payload
  *   shorter than the 60-byte overhead.
  */
@@ -346,10 +409,18 @@ export function parseEnvelope(envelope: SealedEnvelope | string): EnvelopeParts 
     );
   }
   const encoded = envelope.slice(separator + 1);
-  if (!BASE64_PATTERN.test(encoded)) {
+  let payload: Uint8Array;
+  try {
+    payload = base64Decode(encoded);
+  } catch {
+    // Alphabet, length, misplaced padding and non-zero padding bits all arrive
+    // here as a `RangeError`. Re-deciding them with a regex would be a second
+    // definition of "standard base64" free to disagree with the decoder's, and
+    // the disagreement would be exactly the case the regex admitted and the
+    // decoder rejected — which is how the `RangeError` escaped in the first place.
     throw new EnvelopeFormatError("envelope payload is not standard base64");
   }
-  return parseEnvelopeBytes(base64Decode(encoded));
+  return parseEnvelopeBytes(payload);
 }
 
 /** Split raw payload bytes — the form a bundle stores — into the same parts. */

@@ -13,18 +13,35 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { generateApiKey, parseApiKey } from "./api-key.js";
+import { FIELD_DESCRIPTOR_OFFSET, HEADER_OFFSET } from "./bundle/layout.js";
 import { readBundle } from "./bundle/reader.js";
-import { writeBundle, writeBundleWithChecksum } from "./bundle/writer.js";
-import { utf8Decode, utf8Encode } from "./encoding.js";
-import { fieldAssociatedData, formatEnvelope, open, seal } from "./envelope.js";
-import { buildBucket, findBucketEntry, generateGroup, unwrap } from "./group.js";
 import {
+  computeChecksum,
+  writeBundle,
+  writeBundleWithChecksum,
+  writeChecksum,
+} from "./bundle/writer.js";
+import { utf8Decode, utf8Encode } from "./encoding.js";
+import {
+  bucketAssociatedData,
+  fieldAssociatedData,
+  formatEnvelope,
+  open,
+  seal,
+} from "./envelope.js";
+import { buildBucket, findBucketEntry, generateGroup, rotateGroup, unwrap } from "./group.js";
+import {
+  type ApiKeyBytes,
   type BucketEntry,
+  BundleFormatError,
   type BundleInput,
   type ConnectionInput,
   FieldState,
   type KeyGroup,
+  type PrivateKey,
+  type PublicKey,
   type SealedEnvelope,
+  type SealedField,
   VaultDecryptionError,
 } from "./types.js";
 
@@ -78,7 +95,12 @@ describe("a key group wrapped under two API keys", () => {
     const keyB = generateApiKey("live");
     const stranger = generateApiKey("live");
     const bucket = await buildBucket(group.privateKey, [keyA.bytes, keyB.bytes], TENANT, GROUP_ONE);
-    const keyGroup: KeyGroup = { groupId: GROUP_ONE, publicKey: group.publicKey, bucket };
+    const keyGroup: KeyGroup = {
+      groupId: GROUP_ONE,
+      publicKey: group.publicKey,
+      generation: 0,
+      bucket,
+    };
 
     const foundA = await findBucketEntry(keyGroup, keyA.bytes, TENANT);
     const foundB = await findBucketEntry(keyGroup, keyB.bytes, TENANT);
@@ -204,9 +226,9 @@ interface Fixture {
   readonly input: BundleInput;
   readonly groups: ReadonlyArray<{
     readonly groupId: string;
-    readonly publicKey: Uint8Array;
-    readonly privateKey: Uint8Array;
-    readonly apiKey: Uint8Array;
+    readonly publicKey: PublicKey;
+    readonly privateKey: PrivateKey;
+    readonly apiKey: ApiKeyBytes;
     readonly entry: BucketEntry;
   }>;
   readonly secrets: ReadonlyMap<string, string>;
@@ -272,6 +294,7 @@ async function buildFixture(): Promise<Fixture> {
       groups: groups.map((group) => ({
         groupId: group.groupId,
         publicKey: group.publicKey,
+        generation: 0,
         bucket: group.bucket,
       })),
       connections,
@@ -611,5 +634,357 @@ describe("a lookup that misses", () => {
     expect(
       bundle.lookup(`${SHARD}_${CONNECTIONS[0].uuid}`)?.field("client_secret"),
     ).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A forged bundle: the checksum is unkeyed, so sealing has to be checked
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-stamp the header checksum so the forgery below is not caught by accident.
+ *
+ * This is the whole point of the two tests that use it: anyone who can write to
+ * the store can also compute a valid checksum, because it is unkeyed. The
+ * checksum detects truncation and corruption; it is not an authenticity
+ * control, and `readBundle` may not lean on it for one.
+ */
+async function restamp(buffer: Uint8Array): Promise<Uint8Array> {
+  writeChecksum(buffer, await computeChecksum(buffer));
+  return buffer;
+}
+
+/** True when the header's stored checksum matches the bytes that follow it. */
+async function checksumIsValid(buffer: Uint8Array): Promise<boolean> {
+  const stored = buffer.subarray(HEADER_OFFSET.CHECKSUM, HEADER_OFFSET.CHECKSUM + 28);
+  return utf8Decode(await computeChecksum(buffer)) === utf8Decode(stored);
+}
+
+describe("a bundle forged in the store", () => {
+  it("refuses one whose field arrives already open, credential injection and all", async () => {
+    const fixture = await buildFixture();
+    const buffer = await writeBundleWithChecksum(fixture.input);
+    const connectionId = `${SHARD}_${CONNECTIONS[0].uuid}`;
+
+    // Read the pristine bundle once, purely to learn where the slot is.
+    const descriptor = readBundle(buffer).lookup(connectionId)?.field("api_key");
+    if (descriptor === undefined) {
+      throw new Error("the fixture's first connection has no api_key field");
+    }
+
+    // The attack, end to end: overwrite the arena slot with a credential of the
+    // attacker's choosing, declare its length, flip the flag, re-stamp.
+    const injected = utf8Encode("sk-live-attacker-controlled");
+    buffer.set(injected, descriptor.strsOffset);
+    const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    view.setUint32(
+      descriptor.descriptorOffset + FIELD_DESCRIPTOR_OFFSET.PLAIN_LEN,
+      injected.byteLength,
+      true,
+    );
+    view.setUint8(descriptor.descriptorOffset + FIELD_DESCRIPTOR_OFFSET.STATE, FieldState.Open);
+    await restamp(buffer);
+
+    // The checksum is no obstacle whatsoever — it verifies over the forgery.
+    await expect(checksumIsValid(buffer)).resolves.toBe(true);
+    // Refused at load, before any view of it exists to be asked for the field.
+    expect(() => readBundle(buffer)).toThrow(BundleFormatError);
+    expect(() => readBundle(buffer)).toThrow(/arrives open/);
+  });
+
+  it("refuses one whose field claims more plaintext than its slot holds", async () => {
+    const fixture = await buildFixture();
+    const buffer = await writeBundleWithChecksum(fixture.input);
+    const connectionId = `${SHARD}_${CONNECTIONS[0].uuid}`;
+    const descriptor = readBundle(buffer).lookup(connectionId)?.field("password");
+    if (descriptor === undefined) {
+      throw new Error("the fixture's first connection has no password field");
+    }
+
+    const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    view.setUint32(
+      descriptor.descriptorOffset + FIELD_DESCRIPTOR_OFFSET.PLAIN_LEN,
+      descriptor.sealedLen + 1,
+      true,
+    );
+    await restamp(buffer);
+
+    await expect(checksumIsValid(buffer)).resolves.toBe(true);
+    expect(() => readBundle(buffer)).toThrow(BundleFormatError);
+    expect(() => readBundle(buffer)).toThrow(/cannot live in its/);
+  });
+
+  it("does not let a plain_len forged after load read the next slot's bytes", async () => {
+    // The same defect, forged past the load-time check: a resident buffer is
+    // mutated by every open, so the descriptor is re-read on every access and
+    // the bound has to hold there too, not only at load.
+    const fixture = await buildFixture();
+    const buffer = writeBundle(fixture.input);
+    const bundle = readBundle(buffer);
+    const connectionId = `${SHARD}_${CONNECTIONS[0].uuid}`;
+    const record = bundle.lookup(connectionId);
+    const sealed = record?.field("password");
+    const group = fixture.groups[CONNECTIONS[0].group];
+    if (record === undefined || sealed === undefined || group === undefined) {
+      throw new Error("the fixture's first connection is not readable");
+    }
+
+    const plaintext = await open(
+      record.fieldBytes(sealed),
+      group.privateKey,
+      fieldAssociatedData(connectionId, "password"),
+      group.publicKey,
+    );
+    const live = bundle.writeBack(sealed, plaintext);
+    expect(utf8Decode(record.fieldBytes(live))).toBe(
+      fixture.secrets.get(`${connectionId}/password`),
+    );
+
+    // Now claim the field runs to the end of the section that follows it.
+    const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    view.setUint32(
+      live.descriptorOffset + FIELD_DESCRIPTOR_OFFSET.PLAIN_LEN,
+      live.sealedLen + 64,
+      true,
+    );
+
+    expect(() => record.fieldBytes(live)).toThrow(BundleFormatError);
+    expect(() => bundle.lookup(connectionId)?.field("password")).toThrow(/cannot live in its/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rotation: one operation, and the old private half is finished
+// ---------------------------------------------------------------------------
+
+describe("rotating a key group after a key is removed", () => {
+  const CONNECTION_A = `${SHARD}_${makeUuid(0x31313131, 0x00000301)}`;
+  const CONNECTION_B = `${SHARD}_${makeUuid(0x32323232, 0x00000302)}`;
+  const PLAINTEXTS: ReadonlyArray<readonly [string, string, string]> = [
+    [CONNECTION_A, "password", "hunter2-éè-🔑"],
+    [CONNECTION_A, "api_key", "sk-a-0123456789"],
+    [CONNECTION_B, "password", ""],
+    [CONNECTION_B, "refresh_token", "rt-b-abcdefghijklmnop"],
+  ];
+
+  it("reseals every field to a new K1 that both surviving keys open, and no other", async () => {
+    const old = await generateGroup();
+    const keyA = generateApiKey("live");
+    const keyB = generateApiKey("test");
+    const staying = [keyA, keyB];
+    const removed = generateApiKey("live");
+    const before = await buildBucket(
+      old.privateKey,
+      [keyA.bytes, keyB.bytes, removed.bytes],
+      TENANT,
+      GROUP_ONE,
+    );
+    expect(before).toHaveLength(3);
+
+    const fields: SealedField[] = await Promise.all(
+      PLAINTEXTS.map(async ([connectionId, fieldName, secret]): Promise<SealedField> => {
+        const identity = { connectionId, fieldName };
+        return {
+          identity,
+          envelope: await seal(
+            utf8Encode(secret),
+            old.publicKey,
+            fieldAssociatedData(connectionId, fieldName),
+          ),
+        };
+      }),
+    );
+
+    const rotated = await rotateGroup(
+      old.privateKey,
+      fields,
+      [keyA.bytes, keyB.bytes],
+      TENANT,
+      GROUP_ONE,
+    );
+
+    // One result or none: a new pair, every field, one entry per surviving key.
+    expect(rotated.publicKey).not.toEqual(old.publicKey);
+    expect(rotated.privateKey).not.toEqual(old.privateKey);
+    expect(rotated.fields).toHaveLength(PLAINTEXTS.length);
+    expect(rotated.bucket).toHaveLength(2);
+
+    const group: KeyGroup = {
+      groupId: GROUP_ONE,
+      publicKey: rotated.publicKey,
+      generation: 1,
+      bucket: rotated.bucket,
+    };
+
+    // BOTH surviving keys open EVERY resealed field.
+    for (const key of staying) {
+      const entry = await findBucketEntry(group, key.bytes, TENANT);
+      if (entry === undefined) {
+        throw new Error("a surviving key has no entry in the rebuilt bucket");
+      }
+      const privateKey = await unwrap(entry, key.bytes, TENANT, GROUP_ONE);
+      expect(privateKey).toEqual(rotated.privateKey);
+
+      for (const [index, field] of rotated.fields.entries()) {
+        const expected = PLAINTEXTS[index];
+        if (expected === undefined) {
+          throw new Error("rotation returned more fields than it was given");
+        }
+        // The identity is carried through unchanged: rotation changes the
+        // recipient, never what the envelope is bound to.
+        expect(field.identity.connectionId).toBe(expected[0]);
+        expect(field.identity.fieldName).toBe(expected[1]);
+        const opened = await open(
+          field.envelope,
+          privateKey,
+          fieldAssociatedData(expected[0], expected[1]),
+          rotated.publicKey,
+        );
+        expect(utf8Decode(opened)).toBe(expected[2]);
+      }
+    }
+
+    // The removed key finds nothing in the rebuilt bucket.
+    expect(await findBucketEntry(group, removed.bytes, TENANT)).toBeUndefined();
+  });
+
+  it("leaves the old private half able to open none of the resealed fields", async () => {
+    const old = await generateGroup();
+    const key = generateApiKey("live");
+    const fields: SealedField[] = await Promise.all(
+      PLAINTEXTS.map(async ([connectionId, fieldName, secret]): Promise<SealedField> => {
+        return {
+          identity: { connectionId, fieldName },
+          envelope: await seal(
+            utf8Encode(secret),
+            old.publicKey,
+            fieldAssociatedData(connectionId, fieldName),
+          ),
+        };
+      }),
+    );
+
+    const rotated = await rotateGroup(old.privateKey, fields, [key.bytes], TENANT, GROUP_ONE);
+
+    for (const field of rotated.fields) {
+      const aad = fieldAssociatedData(field.identity.connectionId, field.identity.fieldName);
+      // Both with and without the stale public half handed in: the salt is
+      // wrong either way and the tag simply fails.
+      await expect(open(field.envelope, old.privateKey, aad, old.publicKey)).rejects.toBeInstanceOf(
+        VaultDecryptionError,
+      );
+      await expect(open(field.envelope, old.privateKey, aad)).rejects.toBeInstanceOf(
+        VaultDecryptionError,
+      );
+    }
+
+    // ...while the same envelopes open under the new half, so the assertion
+    // above is about the key and not about a broken envelope.
+    for (const [index, field] of rotated.fields.entries()) {
+      const expected = PLAINTEXTS[index];
+      if (expected === undefined) {
+        throw new Error("rotation returned more fields than it was given");
+      }
+      const opened = await open(
+        field.envelope,
+        rotated.privateKey,
+        fieldAssociatedData(expected[0], expected[1]),
+        rotated.publicKey,
+      );
+      expect(utf8Decode(opened)).toBe(expected[2]);
+    }
+  });
+
+  it("refuses to rotate into a bucket no key would survive in", async () => {
+    const old = await generateGroup();
+    await expect(rotateGroup(old.privateKey, [], [], TENANT, GROUP_ONE)).rejects.toBeInstanceOf(
+      RangeError,
+    );
+  });
+
+  it("fails whole when a field cannot be opened, rather than returning part of a rotation", async () => {
+    const old = await generateGroup();
+    const stranger = await generateGroup();
+    const key = generateApiKey("live");
+    const identity = { connectionId: CONNECTION_A, fieldName: "password" };
+    const fields: SealedField[] = [
+      {
+        identity,
+        envelope: await seal(
+          utf8Encode("openable"),
+          old.publicKey,
+          fieldAssociatedData(identity.connectionId, identity.fieldName),
+        ),
+      },
+      {
+        // Sealed to somebody else's group: the old private half cannot open it.
+        identity: { connectionId: CONNECTION_B, fieldName: "password" },
+        envelope: await seal(
+          utf8Encode("not openable"),
+          stranger.publicKey,
+          fieldAssociatedData(CONNECTION_B, "password"),
+        ),
+      },
+    ];
+
+    await expect(
+      rotateGroup(old.privateKey, fields, [key.bytes], TENANT, GROUP_ONE),
+    ).rejects.toBeInstanceOf(VaultDecryptionError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The AAD collision the length prefix exists to close
+// ---------------------------------------------------------------------------
+
+describe("associated data that plain concatenation would have collided", () => {
+  it('refuses ("conn", "1password") opened as ("conn1", "password")', async () => {
+    const group = await generateGroup();
+    const sealedFor = fieldAssociatedData("conn", "1password");
+    const shifted = fieldAssociatedData("conn1", "password");
+
+    // Plain concatenation is the defect the length prefix exists to close: both
+    // pairs produce the identical byte string "conn1password".
+    const concatenated = (a: string, b: string): Uint8Array => utf8Encode(a + b);
+    expect(concatenated("conn", "1password")).toEqual(concatenated("conn1", "password"));
+    // The length-prefixed construction does not collide.
+    expect(sealedFor).not.toEqual(shifted);
+
+    const envelope = await seal(utf8Encode("hunter2"), group.publicKey, sealedFor);
+    await expect(open(envelope, group.privateKey, shifted, group.publicKey)).rejects.toBeInstanceOf(
+      VaultDecryptionError,
+    );
+    // The positive control: under the AAD it was actually sealed with, it opens.
+    expect(utf8Decode(await open(envelope, group.privateKey, sealedFor, group.publicKey))).toBe(
+      "hunter2",
+    );
+  });
+
+  it('refuses a bucket entry sealed for ("grp", "10a1b") opened as ("grp1", "0a1b")', async () => {
+    const group = await generateGroup();
+    const sealedFor = bucketAssociatedData("grp", "10a1b");
+    const shifted = bucketAssociatedData("grp1", "0a1b");
+    expect(sealedFor).not.toEqual(shifted);
+
+    const envelope = await seal(group.privateKey, group.publicKey, sealedFor);
+    await expect(open(envelope, group.privateKey, shifted, group.publicKey)).rejects.toBeInstanceOf(
+      VaultDecryptionError,
+    );
+  });
+
+  it("binds the exact bytes: a group id differing only in case opens nothing", async () => {
+    const group = await generateGroup();
+    const key = generateApiKey("live");
+    const [entry] = await buildBucket(group.privateKey, [key.bytes], TENANT, GROUP_ONE);
+    if (entry === undefined) {
+      throw new Error("buildBucket returned no entries");
+    }
+    // Components are never canonicalised, trimmed or lower-cased.
+    await expect(unwrap(entry, key.bytes, TENANT, GROUP_ONE.toUpperCase())).rejects.toBeInstanceOf(
+      VaultDecryptionError,
+    );
+    await expect(unwrap(entry, key.bytes, ` ${TENANT}`, GROUP_ONE)).rejects.toBeInstanceOf(
+      VaultDecryptionError,
+    );
   });
 });
