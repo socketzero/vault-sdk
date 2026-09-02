@@ -389,11 +389,16 @@ describe("revealDump against a damaged bucket", () => {
     const entry = first.bucket.find((e) => e.wrapped.length > 4);
     if (entry === undefined) throw new Error("no bucket entry");
 
+    // The replacement has to differ from the character already there. Writing a
+    // literal "A" corrupts nothing on the 1-in-64 run where the wrapped blob
+    // already begins with one, and the entry then opens exactly as it should —
+    // a test that passes because the fixture happened to cooperate. The leading
+    // base64 character carries the top six bits of the first byte, so any other
+    // symbol is a different byte and the GCM tag has to reject it.
+    const damaged = `${entry.wrapped.startsWith("A") ? "B" : "A"}${entry.wrapped.slice(1)}`;
     const damagedGroup = {
       ...first,
-      bucket: first.bucket.map((e) =>
-        e === entry ? { ...e, wrapped: `A${e.wrapped.slice(1)}` } : e,
-      ),
+      bucket: first.bucket.map((e) => (e === entry ? { ...e, wrapped: damaged } : e)),
     };
     const result = await revealDump(
       { ...dump, groups: [damagedGroup, ...rest] },
