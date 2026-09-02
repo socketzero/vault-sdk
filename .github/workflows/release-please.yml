@@ -90,8 +90,18 @@ jobs:
         if: steps.gate.outputs.ok == 'true'
         run: npm run check
 
-      # No NODE_AUTH_TOKEN. OIDC supplies the credential, and npm attaches
-      # provenance automatically for a trusted-publisher release.
+      # No NODE_AUTH_TOKEN: OIDC supplies the credential.
+      #
+      # Deliberately no --provenance. GitHub withdrew provenance for private
+      # source repositories in July 2023, and it is the *repository* visibility
+      # that decides, not the package's — a public package built from a private
+      # repo is exactly the unsupported case, and the publish fails with
+      # "Unsupported GitHub Actions source repository visibility". Trusted
+      # publishing does not change this: 0.3.0 and 0.3.1 both published with
+      # signatures and no attestation.
+      #
+      # Making socketzero/vault-sdk public is the only thing that unlocks it.
+      # Add --provenance in the same change, never before.
       - name: Publish
         if: steps.gate.outputs.ok == 'true'
         run: npm publish
