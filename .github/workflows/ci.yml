@@ -90,9 +90,12 @@ jobs:
           npm init -y > /dev/null
           npm install --no-save "$GITHUB_WORKSPACE"/socket0-vault-sdk-*.tgz > /dev/null
           node --input-type=module <<'JS'
-          import { generateGroup, seal, open, fieldAssociatedData } from "@socket0/vault-sdk";
+          import { generateGroup, seal, open, fieldAssociatedData, layout } from "@socket0/vault-sdk";
           const pair = await generateGroup();
-          const aad = fieldAssociatedData("conn", "field");
+          // The AAD binds the raw UUID bytes, so a consumer has to parse an id
+          // rather than hand over the string it displays.
+          const uuid = layout.parseUuid("0192a7c1-0000-4000-8000-000000000001");
+          const aad = fieldAssociatedData(uuid, "field");
           const envelope = await seal(new TextEncoder().encode("round trip"), pair.publicKey, aad);
           const plaintext = new TextDecoder().decode(await open(envelope, pair.privateKey, aad));
           if (plaintext !== "round trip") throw new Error("consumer round-trip failed");
