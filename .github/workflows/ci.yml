@@ -1,7 +1,7 @@
 name: CI
 
-# Triggers carry no attacker-controlled text, and no step interpolates
-# github.event.* into a run: command.
+# Triggers carry no attacker-controlled text, and no run: step interpolates
+# github.event.* — nothing here consumes untrusted input.
 on:
   push:
     branches: [main]
@@ -12,20 +12,89 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
+# Default to nothing; each job takes only what it needs.
+permissions: {}
 
 jobs:
   check:
-    name: Typecheck, lint, tests, coverage
+    name: Check on Node ${{ matrix.node }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # package.json declares engines.node >= 22, so prove it on the versions
+        # a consumer can actually install under — not just the one we develop on.
+        node: ["22", "24"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # Third-party and first-party actions alike are pinned to a commit SHA: a
+      # moved tag in any of them would run unreviewed code in a repository that
+      # publishes a cryptography package.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      # typecheck + biome + vitest under the 100% coverage threshold
+      - run: npm run check
+
+  package:
+    name: Tarball contents
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
           cache: npm
       - run: npm ci
-      # typecheck + biome + vitest with the 100% coverage threshold
-      - run: npm run check
+
+      # `files` is easy to break silently, and getting it wrong publishes
+      # something nobody intended — TypeScript source, or source maps pointing at
+      # files that are not in the tarball. Assert the shape rather than trusting
+      # that whoever edited package.json re-read npm pack.
+      - name: Assert the published tarball ships dist and bin only
+        run: |
+          npm pack --dry-run --json > pack.json
+          node --input-type=module <<'JS'
+          import { readFileSync } from "node:fs";
+          const files = JSON.parse(readFileSync("pack.json", "utf8"))[0].files.map((f) => f.path);
+          const offenders = files.filter(
+            (f) => f.startsWith("src/") || f.endsWith(".map") || f.endsWith(".test.js"),
+          );
+          if (offenders.length > 0) {
+            console.error("These must not be published:\n  " + offenders.join("\n  "));
+            process.exit(1);
+          }
+          for (const required of ["dist/index.js", "dist/index.d.ts", "bin/s0bundle.js", "LICENSE"]) {
+            if (!files.includes(required)) {
+              console.error(`missing from the tarball: ${required}`);
+              process.exit(1);
+            }
+          }
+          console.log(`tarball ok — ${files.length} files, no source, no maps`);
+          JS
+
+      # The package is ESM with an exports map; prove a consumer can actually
+      # import it, rather than only that it compiled.
+      - name: Assert the built package imports and works
+        run: |
+          npm pack --silent > /dev/null
+          mkdir -p /tmp/consumer && cd /tmp/consumer
+          npm init -y > /dev/null
+          npm install --no-save "$GITHUB_WORKSPACE"/socket0-vault-sdk-*.tgz > /dev/null
+          node --input-type=module <<'JS'
+          import { generateGroup, seal, open, fieldAssociatedData } from "@socket0/vault-sdk";
+          const pair = await generateGroup();
+          const aad = fieldAssociatedData("conn", "field");
+          const envelope = await seal(new TextEncoder().encode("round trip"), pair.publicKey, aad);
+          const plaintext = new TextDecoder().decode(await open(envelope, pair.privateKey, aad));
+          if (plaintext !== "round trip") throw new Error("consumer round-trip failed");
+          console.log("consumer import ok — sealed and opened from the packed tarball");
+          JS

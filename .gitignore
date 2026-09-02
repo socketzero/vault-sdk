@@ -8,3 +8,4 @@ coverage/
 *.log
 bench-results.json
 bench-report.md
+*.tgz
