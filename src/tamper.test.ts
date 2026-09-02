@@ -14,11 +14,24 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { CONN_RECORD_BYTES, FIELD_DESCRIPTOR_OFFSET, SECTION_KIND } from "./bundle/layout.js";
+import {
+  CONN_OFFSET,
+  CONN_RECORD_BYTES,
+  FIELD_DESCRIPTOR_OFFSET,
+  GRUP_OFFSET,
+  HEADER_OFFSET,
+  SECTION_KIND,
+} from "./bundle/layout.js";
 import { readBundle } from "./bundle/reader.js";
-import { computeChecksum, writeChecksum } from "./bundle/writer.js";
+import { computeChecksum, writeBundleWithChecksum, writeChecksum } from "./bundle/writer.js";
 import { utf8Encode } from "./encoding.js";
-import { connectionId, makeFixture } from "./lifecycle.fixture.js";
+import {
+  connectionId,
+  makeConnection,
+  makeFixture,
+  makeGroup,
+  makeUuid,
+} from "./lifecycle.fixture.js";
 import { BundleFormatError, FieldState } from "./types.js";
 
 const ATTACKER = "ATTACKER-CREDENTIAL";
@@ -155,5 +168,159 @@ describe("a bundle forged by someone with write access to the store", () => {
     const stored = record.fieldBytes(descriptor);
     expect(descriptor.state).toBe(FieldState.Sealed);
     expect(new TextDecoder().decode(stored)).not.toContain("sk_test");
+  });
+});
+
+/**
+ * H1 — a forged bundle that aliases a mutable field slot to a region the reader
+ * hands back in the clear. Every bundle here re-stamps a valid checksum, loads
+ * with every field still sealed, and yet — before the fix — would leak a
+ * decrypted credential the moment the shard opened the field for a real request.
+ * `readBundle` now refuses each at load; the boundary "misroute yes, credential
+ * no" holds again.
+ */
+describe("a forged bundle that aliases a writable slot", () => {
+  it("is refused when a connection target is repointed at its own field slot", async () => {
+    const { bytes } = await makeFixture();
+    const forged = bytes.slice();
+
+    const view = readBundle(forged);
+    const record = view.lookup(connectionId(0x00000001));
+    const descriptor = record?.field("password");
+    if (record === undefined || descriptor === undefined) throw new Error("no field");
+
+    // The plaintext length is public: an envelope is always 60 bytes larger.
+    const dv = new DataView(forged.buffer, forged.byteOffset, forged.byteLength);
+    dv.setUint32(record.recordOffset + CONN_OFFSET.TARGET_OFFSET, descriptor.strsOffset, true);
+    dv.setUint32(record.recordOffset + CONN_OFFSET.TARGET_LENGTH, descriptor.sealedLen - 60, true);
+    await restamp(forged);
+
+    expect(() => readBundle(forged)).toThrow(BundleFormatError);
+    expect(() => readBundle(forged)).toThrow(/writable slot would be read back/);
+  });
+
+  it("is refused when a target is repointed at another connection's field slot", async () => {
+    const { bytes } = await makeFixture();
+    const forged = bytes.slice();
+
+    const view = readBundle(forged);
+    const victim = view.lookup(connectionId(0x00000001));
+    const donor = view.lookup(connectionId(0x0000002a));
+    const donorField = donor?.field("apiKey");
+    if (victim === undefined || donorField === undefined) throw new Error("no field");
+
+    const dv = new DataView(forged.buffer, forged.byteOffset, forged.byteLength);
+    dv.setUint32(victim.recordOffset + CONN_OFFSET.TARGET_OFFSET, donorField.strsOffset, true);
+    dv.setUint32(victim.recordOffset + CONN_OFFSET.TARGET_LENGTH, donorField.sealedLen - 60, true);
+    await restamp(forged);
+
+    expect(() => readBundle(forged)).toThrow(/writable slot would be read back/);
+  });
+
+  it("is refused when two field descriptors point at one slot", async () => {
+    const { bytes } = await makeFixture();
+    const forged = bytes.slice();
+
+    const view = readBundle(forged);
+    const record = view.lookup(connectionId(0x00000001));
+    const first = record?.field("username");
+    const second = record?.field("password");
+    if (first === undefined || second === undefined) throw new Error("no fields");
+
+    // Alias the second descriptor onto the first's slot: opening one publishes
+    // plaintext the other reads back.
+    const dv = new DataView(forged.buffer, forged.byteOffset, forged.byteLength);
+    dv.setUint32(
+      second.descriptorOffset + FIELD_DESCRIPTOR_OFFSET.STRS_OFFSET,
+      first.strsOffset,
+      true,
+    );
+    dv.setUint32(
+      second.descriptorOffset + FIELD_DESCRIPTOR_OFFSET.SEALED_LEN,
+      first.sealedLen,
+      true,
+    );
+    await restamp(forged);
+
+    expect(() => readBundle(forged)).toThrow(/two writable slots share bytes/);
+  });
+
+  it("is refused when a field slot points outside the STRS arena", async () => {
+    const { bytes } = await makeFixture();
+    const forged = bytes.slice();
+
+    const view = readBundle(forged);
+    const record = view.lookup(connectionId(0x00000001));
+    const descriptor = record?.field("password");
+    if (record === undefined || descriptor === undefined) throw new Error("no field");
+
+    // Point the slot back into the CONN section, where a write-back would corrupt
+    // record pointers rather than land in the value arena.
+    const dv = new DataView(forged.buffer, forged.byteOffset, forged.byteLength);
+    dv.setUint32(
+      descriptor.descriptorOffset + FIELD_DESCRIPTOR_OFFSET.STRS_OFFSET,
+      record.recordOffset,
+      true,
+    );
+    await restamp(forged);
+
+    expect(() => readBundle(forged)).toThrow(/lies outside the STRS arena/);
+  });
+
+  it("still loads a legitimate bundle whose immutable values are interned and shared", async () => {
+    // The audit rejects only mutable-slot aliases. A legitimate bundle interns
+    // identical targets, visible maps and field-name tables, so many records
+    // share one immutable region — which must remain legal.
+    const group = await makeGroup({ groupId: makeUuid(0xc3c3c3c3, 3), keys: ["test"] });
+    const shared = {
+      group,
+      target: "https://api.shared.test",
+      visible: { tier: "gold", live: true },
+      secrets: { token: "shared-secret" },
+    };
+    const input = {
+      header: { version: 1, generation: 1n, shard: "eumc", builtAt: 1n },
+      groups: [group.keyGroup],
+      connections: [
+        await makeConnection({ ...shared, connectionId: connectionId(0x00000011) }),
+        await makeConnection({ ...shared, connectionId: connectionId(0x00000012) }),
+        await makeConnection({ ...shared, connectionId: connectionId(0x00000013) }),
+      ],
+      filters: [],
+    };
+    const bytes = await writeBundleWithChecksum(input);
+
+    const view = readBundle(bytes);
+    expect(view.connectionCount).toBe(3);
+    const record = view.lookup(connectionId(0x00000012));
+    expect(record?.target()).toBe("https://api.shared.test");
+  });
+
+  it("is refused when a group's bucket offset points past the buffer", async () => {
+    const { bytes } = await makeFixture();
+    const forged = bytes.slice();
+
+    const group = readBundle(forged).group(0);
+    if (group === undefined) throw new Error("no group");
+    const dv = new DataView(forged.buffer, forged.byteOffset, forged.byteLength);
+    dv.setUint32(group.recordOffset + GRUP_OFFSET.BUCKET_OFFSET, 0xfffffff0, true);
+    await restamp(forged);
+
+    expect(() => readBundle(forged)).toThrow(/bucket entry of group 0 runs past the buffer/);
+  });
+
+  it("is refused when the STRS section is dropped but sealed fields remain", async () => {
+    const { bytes } = await makeFixture();
+    const forged = bytes.slice();
+
+    // Drop STRS — the last section — from the table walk. The field slots still
+    // point where STRS was, but there is no longer a declared arena to prove they
+    // live inside, so a bundle that still carries sealed fields must be refused.
+    const dv = new DataView(forged.buffer, forged.byteOffset, forged.byteLength);
+    const sections = dv.getUint32(HEADER_OFFSET.SECTIONS, true);
+    dv.setUint32(HEADER_OFFSET.SECTIONS, sections - 1, true);
+    await restamp(forged);
+
+    expect(() => readBundle(forged)).toThrow(/must carry a STRS section/);
   });
 });

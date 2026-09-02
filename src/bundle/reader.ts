@@ -55,6 +55,7 @@ import {
   type VisibleValue,
 } from "../types.js";
 import {
+  BUCKET_ENTRY_BYTES,
   BUCKET_ENTRY_OFFSET,
   BUNDLE_MAGIC,
   BUNDLE_MAGIC_BYTES,
@@ -383,6 +384,10 @@ export function readBundle(buffer: Uint8Array | ArrayBuffer): BundleView {
   const conn = requiredSection(sections, "CONN");
   const grup = requiredSection(sections, "GRUP");
   const filt = requiredSection(sections, "FILT");
+  // Not required — the schema does not list STRS — but a bundle carrying any
+  // sealed value must have somewhere to put it, which `assertMutableSlotsIsolated`
+  // enforces the moment a mutable slot exists.
+  const strs = sections.get(SECTION_KIND.STRS);
 
   // CONN and FILT are pure arrays of fixed-width records, so their length is
   // exactly count * width and anything else is a lie about one of the two.
@@ -396,6 +401,7 @@ export function readBundle(buffer: Uint8Array | ArrayBuffer): BundleView {
   const groupCount = grup.count;
 
   assertEntirelySealed(bytes, view, conn, grup);
+  assertMutableSlotsIsolated(bytes, view, conn, grup, filt, strs);
 
   // ---- shared primitives ------------------------------------------------
 
@@ -713,14 +719,20 @@ export function readBundle(buffer: Uint8Array | ArrayBuffer): BundleView {
           return undefined;
         }
         const wanted = hexDecode(keyId);
+        // The scan runs to the end and never stops early on a hit. `group.ts`
+        // spells out why (adr/0012): returning on first match makes the elapsed
+        // time depend on where in the bucket the match sits, which is an oracle
+        // for the key ids a group holds. This is the hot shard path, so it is the
+        // one place that must not leak.
+        let match: BucketEntryView | undefined;
         for (let i = 0; i < bucketSize; i += 1) {
           const offset = bucketEntryOffset(bucketOffset, i);
           const candidate = slice(offset + BUCKET_ENTRY_OFFSET.KEY_ID, KEY_ID_BYTES, "a key id");
           if (timingSafeEqual(wanted, candidate)) {
-            return makeBucketEntry(offset);
+            match = makeBucketEntry(offset);
           }
         }
-        return undefined;
+        return match;
       },
       privateKeyDescriptor: () =>
         readFieldDescriptor(bytes, recordOffset + GRUP_OFFSET.PRIVATE_DESCRIPTOR),
@@ -1036,6 +1048,191 @@ function assertSealed(descriptor: FieldDescriptor, what: string): void {
   if (descriptor.state !== FieldState.Sealed || descriptor.plainLen !== 0) {
     throw new BundleFormatError(`${what} arrives open; a freshly loaded bundle is entirely sealed`);
   }
+}
+
+/** A half-open byte interval `[start, end)` together with what named it. */
+type Region = readonly [start: number, end: number, what: string];
+
+/**
+ * Every mutable slot must alias nothing.
+ *
+ * A **mutable slot** is a region `writeBack` overwrites in place: a field's arena
+ * slot, and a group's private-key scratch. Until this audit the reader bounded
+ * every pointer against the buffer but never compared pointers against one
+ * another, and that gap is the cheapest attack on the format.
+ *
+ * The checksum is unkeyed, so store-write access is enough to forge a bundle.
+ * `assertEntirelySealed` stops the obvious forgery — a field that arrives already
+ * open — but not this one: point a connection's `target` (or a `visible` value, a
+ * field name, a filter's args, or a second field's descriptor) at a *still-sealed*
+ * field's slot, and the bundle loads clean because that field is `state == 0`.
+ * Then the shard's own legitimate open writes the plaintext into the slot, and the
+ * aliased reader — `target()` is routing data that gets resolved and logged — hands
+ * the decrypted credential back with no cryptography run by the attacker.
+ *
+ * The defence is structural. Collect every mutable slot and every immutable region
+ * a record points at, then require that no mutable slot lies outside STRS, overlaps
+ * another mutable slot, or overlaps any immutable region. The writer already lays
+ * the arena out this way — mutable values are placed uniquely, immutable ones are
+ * interned and freely shared — so this rejects only forged bundles. Interned
+ * duplicates share offsets among themselves, never with a mutable slot, so a
+ * legitimate bundle full of them still passes.
+ *
+ * Runs once per load, never per request; the sort and the sweep are off the hot
+ * path entirely.
+ */
+function assertMutableSlotsIsolated(
+  bytes: Uint8Array,
+  view: DataView,
+  conn: SectionEntry,
+  grup: SectionEntry,
+  filt: SectionEntry,
+  strs: SectionEntry | undefined,
+): void {
+  const mutable: Region[] = [];
+  const immutable: Region[] = [];
+  const addImmutable = (start: number, length: number, what: string): void => {
+    if (length > 0) immutable.push([start, start + length, what]);
+  };
+  const addMutable = (descriptorOffset: number, what: string): void => {
+    const start = view.getUint32(descriptorOffset + FIELD_DESCRIPTOR_OFFSET.STRS_OFFSET, true);
+    const sealedLen = view.getUint32(descriptorOffset + FIELD_DESCRIPTOR_OFFSET.SEALED_LEN, true);
+    mutable.push([start, start + sealedLen, what]);
+  };
+
+  // Connection records: each field's slot is mutable; target, visible map, filter
+  // indices and the field-name table are immutable regions read back to callers.
+  const connRecords = Math.floor(conn.length / CONN_RECORD_BYTES);
+  for (let i = 0; i < connRecords; i += 1) {
+    const at = connRecordOffset(conn.offset, i);
+    addImmutable(
+      view.getUint32(at + CONN_OFFSET.TARGET_OFFSET, true),
+      view.getUint32(at + CONN_OFFSET.TARGET_LENGTH, true),
+      `the target of the connection at ${at}`,
+    );
+    addImmutable(
+      view.getUint32(at + CONN_OFFSET.VISIBLE_OFFSET, true),
+      view.getUint32(at + CONN_OFFSET.VISIBLE_LENGTH, true),
+      `the visible map of the connection at ${at}`,
+    );
+    addImmutable(
+      view.getUint32(at + CONN_OFFSET.FILTERS_OFFSET, true),
+      view.getUint32(at + CONN_OFFSET.FILTERS_COUNT, true) * 4,
+      `the filter indices of the connection at ${at}`,
+    );
+    // `assertEntirelySealed` has already bounded `fieldCount` at CONN_MAX_FIELDS
+    // and read every descriptor; walking the name table here is bounded work.
+    const fieldCount = view.getUint32(at + CONN_OFFSET.FIELD_COUNT, true);
+    const fieldNamesOffset = view.getUint32(at + CONN_OFFSET.FIELD_NAMES_OFFSET, true);
+    addImmutable(
+      fieldNamesOffset,
+      fieldNamesSpan(view, bytes.byteLength, fieldNamesOffset, fieldCount),
+      `the field-name table of the connection at ${at}`,
+    );
+    for (let f = 0; f < fieldCount; f += 1) {
+      addMutable(fieldDescriptorOffset(at, f), `field ${f} of the connection at ${at}`);
+    }
+  }
+
+  // Group records: the private-key scratch is mutable; each wrapped bucket entry
+  // is immutable.
+  for (let g = 0; g < grup.count; g += 1) {
+    const at = grupRecordOffset(grup.offset, g);
+    const bucketOffset = view.getUint32(at + GRUP_OFFSET.BUCKET_OFFSET, true);
+    const bucketCount = view.getUint32(at + GRUP_OFFSET.BUCKET_COUNT, true);
+    for (let e = 0; e < bucketCount; e += 1) {
+      const entryOffset = bucketEntryOffset(bucketOffset, e);
+      if (entryOffset < 0 || entryOffset + BUCKET_ENTRY_BYTES > bytes.byteLength) {
+        throw new BundleFormatError(`a bucket entry of group ${g} runs past the buffer`);
+      }
+      addImmutable(
+        view.getUint32(entryOffset + BUCKET_ENTRY_OFFSET.WRAPPED_OFFSET, true),
+        view.getUint32(entryOffset + BUCKET_ENTRY_OFFSET.WRAPPED_LENGTH, true),
+        `the wrapped half of a bucket entry of group ${g}`,
+      );
+    }
+    addMutable(at + GRUP_OFFSET.PRIVATE_DESCRIPTOR, `the private half of group ${g}`);
+  }
+
+  // Filter arguments are immutable. `assertSectionExact` has pinned FILT, so every
+  // entry offset here is in-bounds.
+  for (let f = 0; f < filt.count; f += 1) {
+    const at = filtEntryOffset(filt.offset, f);
+    addImmutable(
+      view.getUint32(at + FILT_ENTRY_OFFSET.ARGS_OFFSET, true),
+      view.getUint32(at + FILT_ENTRY_OFFSET.ARGS_LENGTH, true),
+      `the arguments of filter ${f}`,
+    );
+  }
+
+  if (mutable.length === 0) {
+    return;
+  }
+  if (strs === undefined) {
+    throw new BundleFormatError("a bundle with sealed fields must carry a STRS section");
+  }
+  const strsStart = strs.offset;
+  const strsEnd = strs.offset + strs.length;
+
+  // Sorted by start; because mutable slots must end up pairwise disjoint, this is
+  // also their order by end, which is what lets the immutable sweep binary-search.
+  mutable.sort((a, b) => a[0] - b[0]);
+  for (let i = 0; i < mutable.length; i += 1) {
+    const [start, end, what] = mutable[i] as Region;
+    if (start < strsStart || end > strsEnd) {
+      throw new BundleFormatError(`${what} is a writable slot that lies outside the STRS arena`);
+    }
+    if (i > 0) {
+      const previous = mutable[i - 1] as Region;
+      if (previous[1] > start) {
+        throw new BundleFormatError(
+          `${what} overlaps ${previous[2]}: two writable slots share bytes`,
+        );
+      }
+    }
+  }
+
+  for (const [start, end, what] of immutable) {
+    // First mutable slot whose end is past `start`; anything earlier cannot reach
+    // into `[start, end)`.
+    let lo = 0;
+    let hi = mutable.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if ((mutable[mid] as Region)[1] > start) hi = mid;
+      else lo = mid + 1;
+    }
+    const candidate = mutable[lo];
+    if (candidate !== undefined && candidate[0] < end) {
+      throw new BundleFormatError(
+        `${what} overlaps ${candidate[2]}: a writable slot would be read back as this value`,
+      );
+    }
+  }
+}
+
+/**
+ * The byte length of a self-delimiting field-name table: `count` runs of a
+ * `u16` length prefix and its bytes. Bounded against the buffer so a forged
+ * count or length is a refusal, not an out-of-bounds read.
+ */
+function fieldNamesSpan(
+  view: DataView,
+  bufferLength: number,
+  start: number,
+  count: number,
+): number {
+  let cursor = start;
+  for (let i = 0; i < count; i += 1) {
+    if (cursor + 2 > bufferLength) {
+      throw new BundleFormatError("a field-name table's length prefix runs past the buffer");
+    }
+    cursor += 2 + view.getUint16(cursor, true);
+    if (cursor > bufferLength) {
+      throw new BundleFormatError("a field name runs past the buffer");
+    }
+  }
+  return cursor - start;
 }
 
 /** The slot count implied by the INDX section, validated once, at load. */

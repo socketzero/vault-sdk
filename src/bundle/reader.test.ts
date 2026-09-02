@@ -7,6 +7,9 @@
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { deriveKeyIdHex } from "../api-key.js";
+import * as encoding from "../encoding.js";
+import { makeGroup, TENANT } from "../lifecycle.fixture.js";
 import {
   BundleFormatError,
   FieldState,
@@ -39,6 +42,7 @@ import {
   writeBackPlaintext,
   zeroTail,
 } from "./reader.js";
+import { writeBundleWithChecksum } from "./writer.js";
 
 // ---------------------------------------------------------------------------
 // A bundle builder, from the layout constants alone
@@ -1053,18 +1057,44 @@ describe("a corrupt record is refused rather than misread", () => {
     return found;
   };
 
-  it("refuses a target that runs past the buffer", () => {
+  /**
+   * A corruption that makes an immutable region reach into a field slot is a
+   * mutable-slot alias — a mild form of the H1 forgery — so `readBundle` refuses
+   * the whole bundle at load rather than letting an accessor read the aliased
+   * bytes back after the field opens. These cases use this helper; the ones whose
+   * length is too small to reach a slot still load and fail lazily at the
+   * accessor, which the rest of the block exercises.
+   */
+  const corruptLoad = (patch: (view: DataView, recordOffset: number) => void) => {
+    const bundle = fixture();
+    patch(new DataView(bundle.bytes.buffer), bundle.recordOffsets[0] as number);
+    return () => readBundle(bundle.bytes);
+  };
+
+  it("still bounds-checks an accessor whose region points past the buffer", () => {
+    // A pointer aimed past the buffer — rather than into a field slot — is not an
+    // alias, so the load audit lets it through; the accessor's own bounds check
+    // is what refuses it when the value is actually read.
     const record = corrupt((view, at) => {
-      view.setUint32(at + CONN_OFFSET.TARGET_LENGTH, 0xffff, true);
+      view.setUint32(at + CONN_OFFSET.TARGET_OFFSET, 0xfffffff0, true);
     });
     expect(() => record.target()).toThrow(/outside the buffer/);
   });
 
-  it("refuses a visible map that runs past the buffer", () => {
-    const record = corrupt((view, at) => {
-      view.setUint32(at + CONN_OFFSET.VISIBLE_LENGTH, 0xffff, true);
-    });
-    expect(() => record.visibleKeys()).toThrow(/outside the buffer/);
+  it("refuses at load a target length that overruns into a field slot", () => {
+    expect(
+      corruptLoad((view, at) => {
+        view.setUint32(at + CONN_OFFSET.TARGET_LENGTH, 0xffff, true);
+      }),
+    ).toThrow(BundleFormatError);
+  });
+
+  it("refuses at load a visible length that overruns into a field slot", () => {
+    expect(
+      corruptLoad((view, at) => {
+        view.setUint32(at + CONN_OFFSET.VISIBLE_LENGTH, 0xffff, true);
+      }),
+    ).toThrow(BundleFormatError);
   });
 
   it("refuses a visible entry header cut short by its own length", () => {
@@ -1121,25 +1151,66 @@ describe("a corrupt record is refused rather than misread", () => {
     expect(() => record.visibleKeys()).toThrow(/unknown visible value type 9/);
   });
 
-  it("refuses filter indices that run past the buffer", () => {
-    const record = corrupt((view, at) => {
-      view.setUint32(at + CONN_OFFSET.FILTERS_COUNT, 0xffff, true);
-    });
-    expect(() => record.filterIndices()).toThrow(/outside the buffer/);
+  it("refuses at load a filter count that overruns into a field slot", () => {
+    expect(
+      corruptLoad((view, at) => {
+        view.setUint32(at + CONN_OFFSET.FILTERS_COUNT, 0xffff, true);
+      }),
+    ).toThrow(BundleFormatError);
   });
 
-  it("refuses a field-name table that runs past the buffer", () => {
-    const record = corrupt((view, at) => {
-      view.setUint32(at + CONN_OFFSET.FIELD_NAMES_OFFSET, 0xfffffff0, true);
-    });
-    expect(() => record.fieldNames()).toThrow(/runs past the end of its section/);
+  it("refuses at load a field-name table offset that runs past the buffer", () => {
+    expect(
+      corruptLoad((view, at) => {
+        view.setUint32(at + CONN_OFFSET.FIELD_NAMES_OFFSET, 0xfffffff0, true);
+      }),
+    ).toThrow(BundleFormatError);
   });
 
-  it("refuses a field name longer than the buffer", () => {
-    const record = corrupt((view, at) => {
-      view.setUint16(view.getUint32(at + CONN_OFFSET.FIELD_NAMES_OFFSET, true), 0xffff, true);
+  it("refuses at load a field name longer than the buffer", () => {
+    expect(
+      corruptLoad((view, at) => {
+        view.setUint16(view.getUint32(at + CONN_OFFSET.FIELD_NAMES_OFFSET, true), 0xffff, true);
+      }),
+    ).toThrow(BundleFormatError);
+  });
+});
+
+describe("the reader's bucket scan is constant-time", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("scans the whole bucket and does not stop early on a hit", async () => {
+    const group = await makeGroup({
+      groupId: makeUuid(0xd4d4d4d4, 4),
+      keys: ["test", "test", "test"],
     });
-    expect(() => record.fieldNames()).toThrow(/outside the buffer/);
+    const bytes = await writeBundleWithChecksum({
+      header: { version: 1, generation: 1n, shard: "eumc", builtAt: 1n },
+      groups: [group.keyGroup],
+      connections: [],
+      filters: [],
+    });
+    const bucketView = readBundle(bytes).group(0);
+    if (bucketView === undefined) throw new Error("no group");
+    expect(bucketView.bucketSize).toBe(3);
+
+    const [first, , last] = group.keys;
+    if (first === undefined || last === undefined) throw new Error("missing keys");
+    const firstId = await deriveKeyIdHex(first.bytes, TENANT);
+    const lastId = await deriveKeyIdHex(last.bytes, TENANT);
+
+    // Every entry is compared even when the match is the first one: adr/0012
+    // forbids the scan from short-circuiting, because where it stops is an oracle
+    // for which key ids the bucket holds.
+    const spy = vi.spyOn(encoding, "timingSafeEqual");
+    expect(bucketView.findBucketEntry(firstId)).toBeDefined();
+    expect(spy).toHaveBeenCalledTimes(bucketView.bucketSize);
+
+    spy.mockClear();
+    expect(bucketView.findBucketEntry(lastId)).toBeDefined();
+    expect(spy).toHaveBeenCalledTimes(bucketView.bucketSize);
   });
 });
 
