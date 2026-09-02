@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.3.0](https://github.com/socketzero/vault-sdk/compare/v0.2.2...v0.3.0) (2026-09-02)
+
+
+### ⚠ BREAKING CHANGES
+
+* bundles written by earlier builds are not readable, and their envelopes cannot be opened, because the identity bound into every AAD changed. Nothing had shipped on this format.
+
+### Features
+
+* bind the connection UUID, drop the shard from the format ([53d1278](https://github.com/socketzero/vault-sdk/commit/53d12789fb2d42b23258f283fafd5a4a9d482c05))
+
+
+### Bug Fixes
+
+* **ci:** update the consumer check for the new AAD, and de-flake the bench gate ([eff080d](https://github.com/socketzero/vault-sdk/commit/eff080da594d1f6e5fd8649707abc47a8317abf6))
+* **test:** make the damaged-bucket corruption actually corrupt ([2dc9ea7](https://github.com/socketzero/vault-sdk/commit/2dc9ea7305861b2ae07060d51bd556bdc59e82f7))
+
+
+### Documentation
+
+* badge row, and a section that earns the zero-dependency one ([eb9d052](https://github.com/socketzero/vault-sdk/commit/eb9d0521856d4e9e39446713e7546c9467323ab5))
+* drop shard from the README and link npm, source and the playground ([6d5d335](https://github.com/socketzero/vault-sdk/commit/6d5d335a46d64b8245ba52ec97decf2171c65f74))
+* show the playground in the README ([1fcb7ee](https://github.com/socketzero/vault-sdk/commit/1fcb7ee7aac1aeffd6dd91dd9fbbdf7f3fe14f25))
+
 ## [0.2.2](https://github.com/socketzero/vault-sdk/compare/v0.2.1...v0.2.2) (2026-09-02)
 
 

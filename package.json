@@ -1,6 +1,6 @@
 {
   "name": "@socket0/vault-sdk",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "The one implementation of the Socket0 vault: envelopes, key groups, buckets, the API key format and the binary bundle.",
   "homepage": "https://vault.socket0.com",
   "repository": {
