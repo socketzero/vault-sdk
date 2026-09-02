@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/socketzero/vault-sdk/compare/v0.2.0...v0.2.1) (2026-09-02)
+
+
+### Bug Fixes
+
+* **ci:** publish from the release-please workflow, not an on:release one ([033a1da](https://github.com/socketzero/vault-sdk/commit/033a1da3d88b34fce536e62b6836dafb89e97063))
+
 ## [0.2.0](https://github.com/socketzero/vault-sdk/compare/v0.1.0...v0.2.0) (2026-09-02)
 
 
