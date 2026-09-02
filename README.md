@@ -1,16 +1,27 @@
 # @socket0/vault-sdk
 
+[![npm](https://img.shields.io/npm/v/%40socket0%2Fvault-sdk?color=4A56C0&label=npm)](https://www.npmjs.com/package/@socket0/vault-sdk)
+[![playground](https://img.shields.io/badge/playground-vault.socket0.com-4A56C0)](https://vault.socket0.com)
+
 The one implementation of the Socket0 vault: the envelope, the key group and its bucket,
 the API key format, and the binary bundle. No I/O, no globals, no ambient config — every
-input is an argument, which is what makes one build safe in a shard, in the control plane
+input is an argument, which is what makes one build safe at the edge, in the control plane
 and on a laptop.
 
 Three parties call it and must agree byte for byte: the control plane seals a field with a
-group's public half, a shard unwraps that group's private half with a presented API key and
-opens the field, and a tenant's own code generates a group, wraps it under a new API key and
-seals a credential before it is ever transmitted. A disagreement between any two of them is
-a credential one party wrote and another cannot read — discovered weeks later, on somebody's
-first relayed call, with the plaintext long gone.
+group's public half, the relay unwraps that group's private half with a presented API key
+and opens the field, and a tenant's own code generates a group, wraps it under a new API key
+and seals a credential before it is ever transmitted. A disagreement between any two of them
+is a credential one party wrote and another cannot read — discovered weeks later, on
+somebody's first relayed call, with the plaintext long gone.
+
+**[vault.socket0.com](https://vault.socket0.com)** runs this package in the browser: build a
+bundle from a tree form, mint real X25519 groups and API keys, and round-trip to the binary
+in both directions. It is the fastest way to see the format before you depend on it.
+
+- **npm** — <https://www.npmjs.com/package/@socket0/vault-sdk>
+- **Source** — <https://github.com/socketzero/vault-sdk>
+- **Playground** — <https://vault.socket0.com> ([source](https://github.com/socketzero/vault-playground))
 
 ## The catalog is the specification
 

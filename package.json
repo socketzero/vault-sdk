@@ -2,6 +2,23 @@
   "name": "@socket0/vault-sdk",
   "version": "0.2.2",
   "description": "The one implementation of the Socket0 vault: envelopes, key groups, buckets, the API key format and the binary bundle.",
+  "homepage": "https://vault.socket0.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/socketzero/vault-sdk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/socketzero/vault-sdk/issues"
+  },
+  "keywords": [
+    "socket0",
+    "vault",
+    "encryption",
+    "x25519",
+    "hkdf",
+    "aes-gcm",
+    "secrets"
+  ],
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
