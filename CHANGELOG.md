@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/socketzero/vault-sdk/compare/v0.2.1...v0.2.2) (2026-09-02)
+
+
+### Build
+
+* make the package publishable under MIT ([f44271d](https://github.com/socketzero/vault-sdk/commit/f44271d7e6e0b9f26a8c377f46e5760c7e9bce25))
+
 ## [0.2.1](https://github.com/socketzero/vault-sdk/compare/v0.2.0...v0.2.1) (2026-09-02)
 
 
