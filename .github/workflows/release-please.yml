@@ -55,18 +55,31 @@ jobs:
           npm install -g npm@^11.5.1
           npm --version
 
-      # Deliberately inert until publishing is opted into: the package is marked
-      # private, and npm cannot bind a trusted publisher to a name that does not
-      # exist yet. Skipping loudly beats failing every release, and beats
-      # publishing something nobody decided to publish. See RELEASING.md.
+      # Two conditions, both self-clearing, so this never fails a release for a
+      # reason nobody has acted on yet:
+      #
+      #   1. the package is still marked private, or
+      #   2. the name does not exist on the registry yet — npm cannot bind a
+      #      trusted publisher to a package that has never been published, so
+      #      the first version must go up by hand (see RELEASING.md). Publishing
+      #      from CI before that binding exists would fail with no credential.
+      #
+      # Once the bootstrap publish has happened, this gate opens on its own.
       - name: Check publish prerequisites
         id: gate
         run: |
-          if node -e "process.exit(require('./package.json').private === true ? 1 : 0)"; then
-            echo "ok=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::package.json still has \"private\": true — skipping publish. See RELEASING.md."
+          if ! node -e "process.exit(require('./package.json').private === true ? 1 : 0)"; then
+            echo "::notice::package.json has \"private\": true — skipping publish. See RELEASING.md."
             echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          name=$(node -e "process.stdout.write(require('./package.json').name)")
+          code=$(curl -s -o /dev/null -w '%{http_code}' "https://registry.npmjs.org/${name/\//%2f}")
+          if [ "$code" = "404" ]; then
+            echo "::notice::${name} is not on the registry yet. npm cannot bind a trusted publisher to a name that has never been published, so publish the first version by hand — see RELEASING.md. Skipping."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Install

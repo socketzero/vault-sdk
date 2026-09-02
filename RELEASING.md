@@ -49,42 +49,21 @@ is no repo secret.
 The publish job in `release-please.yml` is already written for it. What remains are decisions and a
 one-time bootstrap.
 
-### 1. Decide the package is publishable
+### 1. Licence and visibility — done
 
-`package.json` currently carries:
+The package is `MIT`, `private` is gone, and `publishConfig.access` is `public`.
+The tarball ships `dist` and `bin` only: no TypeScript source, and no source
+maps (they carry no `sourcesContent`, so without `src` they would be dead weight
+pointing at files that are not there). 28 files, ~84 kB packed.
 
-```json
-{ "private": true, "license": "UNLICENSED" }
-```
-
-`private: true` is npm's hard block on publishing, and the workflow refuses to
-publish while it is set. Removing it means this code goes to a registry, so
-settle the licence in the same change — `UNLICENSED` is right for a package that
-stays internal and wrong for one on the public registry. Pick a real SPDX
-identifier (`MIT`, `Apache-2.0`, …), or keep `UNLICENSED` and publish privately
-to a paid npm org.
-
-### 2. Own the `@socket0` scope
-
-A scoped name can only be published by someone with rights to the scope:
+### 2. Confirm the scope is yours
 
 ```bash
+npm login
 npm org ls socket0
-npm access ls-packages @socket0
 ```
 
-If the scope is not yours, claim it or rename the package. **Do not publish
-under a scope you do not control.**
-
-### 3. Choose public or restricted
-
-Scoped packages default to **restricted**. For a public package add:
-
-```json
-"publishConfig": { "access": "public" }
-```
-
-### 4. Bootstrap the first version by hand
+### 3. Bootstrap the first version by hand
 
 This is the one genuinely awkward step, and it is a limitation of npm rather
 than of this setup: **a trusted publisher can only be configured on a package
@@ -101,7 +80,7 @@ npm pack --dry-run        # confirm exactly what ships
 npm publish               # prepack rebuilds dist/ first
 ```
 
-### 5. Bind the trusted publisher
+### 4. Bind the trusted publisher
 
 Then hand publishing to CI and never use a token again — either in the npm web
 UI (Package → Settings → Trusted Publisher) or from the CLI:
@@ -130,10 +109,12 @@ all — it would simply sit idle. Chaining off release-please's own
 If you add `environment:` to the publish job, the same environment name must be
 set on the trusted publisher, or npm rejects the OIDC token.
 
-### 6. Remove `private` and let CI take over
+### 5. That is it
 
-With the publisher bound, drop `"private": true`, merge, and every subsequent
-release publishes itself when its release PR is merged.
+With the publisher bound, every subsequent release publishes itself when its
+release PR is merged. Nothing else to switch on: the CI gate checks whether the
+package exists on the registry and opens by itself once the bootstrap publish
+has landed, so it cannot fail a release for a bootstrap nobody has done yet.
 
 ### Requirements the workflow already handles
 

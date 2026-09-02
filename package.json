@@ -2,8 +2,7 @@
   "name": "@socket0/vault-sdk",
   "version": "0.2.1",
   "description": "The one implementation of the Socket0 vault: envelopes, key groups, buckets, the API key format and the binary bundle.",
-  "license": "UNLICENSED",
-  "private": true,
+  "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -17,9 +16,7 @@
   "files": [
     "dist",
     "bin",
-    "src",
-    "!src/**/*.test.ts",
-    "!src/**/*.fixture.ts"
+    "!dist/**/*.map"
   ],
   "engines": {
     "node": ">=22"
@@ -45,5 +42,8 @@
   },
   "bin": {
     "s0bundle": "./bin/s0bundle.js"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
