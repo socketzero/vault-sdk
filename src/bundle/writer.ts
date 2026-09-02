@@ -451,6 +451,7 @@ function planConnections(
       connRecordOffset(connSectionOffset, index),
       groupIndices,
       input.filters.length,
+      input.header.shard,
       arena,
     );
   });
@@ -461,12 +462,25 @@ function planConnection(
   recordOffset: number,
   groupIndices: ReadonlyMap<string, number>,
   filterCount: number,
+  shard: string,
   arena: Arena,
 ): PlannedConnection {
   const groupIndex = groupIndices.get(connection.groupId);
   if (groupIndex === undefined) {
     throw new RangeError(
       `connection ${connection.connectionId} names key group ${connection.groupId}, which is not in the bundle`,
+    );
+  }
+
+  // The connection id's shard prefix is not stored per record — only the header
+  // shard is. A mismatch here would silently re-home the connection under the
+  // header's shard, so `lookup` finds it but every field's AAD was bound to the
+  // original id and can never open again: permanent, silent data loss discovered
+  // long after the plaintext is gone. Refuse it at publish time instead.
+  const parsedId = parseConnectionId(connection.connectionId);
+  if (parsedId.shard !== shard) {
+    throw new RangeError(
+      `connection ${connection.connectionId} is in shard "${parsedId.shard}", but the bundle is shard "${shard}"`,
     );
   }
 
@@ -480,7 +494,7 @@ function planConnection(
   const visible = encodeVisible(connection);
 
   return {
-    uuid: parseConnectionId(connection.connectionId).uuid,
+    uuid: parsedId.uuid,
     recordOffset,
     groupIndex,
     targetOffset: arenaIntern(arena, target),

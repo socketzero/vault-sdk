@@ -327,6 +327,23 @@ describe("the header", () => {
   });
 });
 
+describe("a connection's shard must match the header", () => {
+  it("refuses a connection id whose shard prefix differs from the header shard", () => {
+    // The prefix is not stored per record. A mismatch would silently re-home the
+    // connection under the header's shard, leaving every field's AAD bound to the
+    // original id and unopenable forever. Refuse it at publish time instead.
+    const mismatched = connection({ connectionId: `wxyz_${UUID_ONE}` });
+    expect(() => writeBundle(bundle({ connections: [mismatched] }))).toThrow(RangeError);
+    expect(() => writeBundle(bundle({ connections: [mismatched] }))).toThrow(
+      /is in shard "wxyz", but the bundle is shard "abcd"/,
+    );
+  });
+
+  it("accepts a connection id whose shard matches the header", () => {
+    expect(() => writeBundle(bundle())).not.toThrow();
+  });
+});
+
 describe("the section table", () => {
   it("names all five sections in buffer order, contiguously", () => {
     const buffer = writeBundle(bundle({ filters: [{ kind: 1, args: bytes(4, 0x09) }] }));
