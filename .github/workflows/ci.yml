@@ -1,0 +1,31 @@
+name: CI
+
+# Triggers carry no attacker-controlled text, and no step interpolates
+# github.event.* into a run: command.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Typecheck, lint, tests, coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      # typecheck + biome + vitest with the 100% coverage threshold
+      - run: npm run check
