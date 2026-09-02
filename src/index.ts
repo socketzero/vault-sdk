@@ -107,6 +107,7 @@ export {
 export {
   AAD_LENGTH_PREFIX_BYTES,
   bucketAssociatedData,
+  CONNECTION_UUID_BYTES,
   derivePublicKey,
   ENVELOPE_OVERHEAD_BYTES,
   EPHEMERAL_PUBLIC_KEY_BYTES,

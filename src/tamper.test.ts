@@ -279,7 +279,7 @@ describe("a forged bundle that aliases a writable slot", () => {
       secrets: { token: "shared-secret" },
     };
     const input = {
-      header: { version: 1, generation: 1n, shard: "eumc", builtAt: 1n },
+      header: { version: 1, generation: 1n, builtAt: 1n },
       groups: [group.keyGroup],
       connections: [
         await makeConnection({ ...shared, connectionId: connectionId(0x00000011) }),
@@ -307,6 +307,20 @@ describe("a forged bundle that aliases a writable slot", () => {
     await restamp(forged);
 
     expect(() => readBundle(forged)).toThrow(/bucket entry of group 0 runs past the buffer/);
+  });
+
+  it("is refused when the header's reserved bytes are not zero", async () => {
+    // Reserved bytes are refused rather than ignored: a writer that set one meant
+    // something by it, and this reader does not know what.
+    const { bytes } = await makeFixture();
+    const forged = bytes.slice();
+    for (let i = 0; i < 4; i += 1) {
+      forged[HEADER_OFFSET.RESERVED + i] = 0xff;
+    }
+    await restamp(forged);
+
+    expect(() => readBundle(forged)).toThrow(BundleFormatError);
+    expect(() => readBundle(forged)).toThrow(/reserved bytes must be zero/);
   });
 
   it("is refused when the STRS section is dropped but sealed fields remain", async () => {

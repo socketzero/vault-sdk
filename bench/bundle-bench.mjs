@@ -80,7 +80,7 @@ function connectionsFor(count, shard, groupId, envelope) {
   const connections = new Array(count);
   for (let i = 0; i < count; i += 1) {
     connections[i] = {
-      connectionId: `${shard}_${crypto.randomUUID()}`,
+      connectionId: crypto.randomUUID(),
       groupId,
       // Varied so the arena cannot intern every record down to one region.
       target: `https://api.tenant-${shard}.example.com/service/${i}`,
@@ -106,7 +106,6 @@ async function buildShard(index) {
   const header = {
     version: 1,
     generation: BigInt(index + 1),
-    shard,
     builtAt: BigInt(Date.now()),
   };
   const plan = (count) => ({
@@ -422,7 +421,7 @@ async function selfTest() {
     const high = (0x10000000 + i).toString(16).padStart(8, "0");
     const uuid = `${high}-0000-0000-0000-00000000beef`;
     return {
-      connectionId: `${shard}_${uuid}`,
+      connectionId: uuid,
       groupId,
       target: `https://clustered.example/${i}`,
       visible: {},

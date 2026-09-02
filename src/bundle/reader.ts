@@ -80,17 +80,17 @@ import {
   grupRecordOffset,
   HEADER_BYTES,
   HEADER_OFFSET,
+  HEADER_RESERVED_BYTES,
   INDEX_EMPTY_SLOT,
   INDEX_SLOT_BYTES,
   INDEX_SLOT_OFFSET,
   indexSlotOffset,
   KEY_ID_BYTES,
-  parseConnectionId,
+  parseUuid,
   SECTION_ENTRY_BYTES,
   SECTION_ENTRY_OFFSET,
   SECTION_KIND,
   SECTION_TABLE_OFFSET,
-  SHARD_PREFIX_BYTES,
   sectionEntryOffset,
   sectionKindName,
   uuidHigh32,
@@ -779,15 +779,13 @@ export function readBundle(buffer: Uint8Array | ArrayBuffer): BundleView {
    * which is what makes a miss cost one read.
    */
   function lookup(connectionId: string): ConnectionRecord | undefined {
-    const id = tryParseConnectionId(connectionId);
-    // An id names both the shard and the connection, so another shard's id
-    // cannot be here and saying so costs nothing.
-    if (id === undefined || id.shard !== header.shard) {
+    const uuid = tryParseUuid(connectionId);
+    if (uuid === undefined) {
       return undefined;
     }
 
-    const fingerprint = uuidHigh32(id.uuid);
-    let slot = bucketOf(uuidLow32(id.uuid), slots);
+    const fingerprint = uuidHigh32(uuid);
+    let slot = bucketOf(uuidLow32(uuid), slots);
     for (let probe = 0; probe < slots; probe += 1) {
       const slotOffset = indexSlotOffset(indx.offset, slot);
       const recordOffset = view.getUint32(slotOffset + INDEX_SLOT_OFFSET.CONN_OFFSET, true);
@@ -797,7 +795,7 @@ export function readBundle(buffer: Uint8Array | ArrayBuffer): BundleView {
       if (view.getUint32(slotOffset + INDEX_SLOT_OFFSET.FINGERPRINT, true) === fingerprint) {
         assertConnRecordOffset(recordOffset);
         const record = makeConnectionRecord(recordOffset);
-        if (record.matchesId(id.uuid)) {
+        if (record.matchesId(uuid)) {
           return record;
         }
       }
@@ -854,12 +852,11 @@ function readHeader(bytes: Uint8Array, view: DataView): BundleHeader {
     }
   }
 
+  // One version, in both directions: this reader implements exactly one layout,
+  // and partial understanding of a security artifact is worse than none.
   const version = view.getUint16(HEADER_OFFSET.VERSION, true);
-  if (version > BUNDLE_VERSION) {
+  if (version !== BUNDLE_VERSION) {
     throw new UnsupportedBundleVersionError(version, BUNDLE_VERSION);
-  }
-  if (version < 1) {
-    throw new BundleFormatError(`a bundle version is at least 1, got ${version}`);
   }
 
   const flags = view.getUint16(HEADER_OFFSET.FLAGS, true);
@@ -867,6 +864,14 @@ function readHeader(bytes: Uint8Array, view: DataView): BundleHeader {
     // Reserved bits are reserved: a writer that set one meant something by it,
     // and this reader does not know what.
     throw new BundleFormatError(`the header flags are reserved and must be zero, got ${flags}`);
+  }
+
+  // Reserved, and refused rather than ignored: a writer that put something here
+  // meant something by it, and this reader does not know what.
+  for (let i = 0; i < HEADER_RESERVED_BYTES; i += 1) {
+    if (bytes[HEADER_OFFSET.RESERVED + i] !== 0) {
+      throw new BundleFormatError("the header's reserved bytes must be zero");
+    }
   }
 
   const sections = view.getUint32(HEADER_OFFSET.SECTIONS, true);
@@ -879,9 +884,6 @@ function readHeader(bytes: Uint8Array, view: DataView): BundleHeader {
     version,
     flags,
     generation: view.getBigUint64(HEADER_OFFSET.GENERATION, true),
-    shard: utf8Decode(
-      bytes.subarray(HEADER_OFFSET.SHARD, HEADER_OFFSET.SHARD + SHARD_PREFIX_BYTES),
-    ),
     builtAt: view.getBigUint64(HEADER_OFFSET.BUILT_AT, true),
     sections,
   };
@@ -1274,11 +1276,9 @@ async function verifyChecksum(bytes: Uint8Array): Promise<boolean> {
  * refuses an id that simply is not here, or the shape of the failure becomes the
  * oracle the index was designed not to be.
  */
-function tryParseConnectionId(
-  connectionId: string,
-): { shard: string; uuid: Uint8Array } | undefined {
+function tryParseUuid(connectionId: string): Uint8Array | undefined {
   try {
-    return parseConnectionId(connectionId);
+    return parseUuid(connectionId);
   } catch {
     return undefined;
   }

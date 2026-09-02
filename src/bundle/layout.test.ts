@@ -16,21 +16,22 @@ import {
   FILT_ENTRY_BYTES,
   fieldDescriptorOffset,
   filtEntryOffset,
+  formatUuid,
   GRUP_RECORD_BYTES,
   grupRecordOffset,
   HEADER_BYTES,
   HEADER_OFFSET,
+  HEADER_RESERVED_BYTES,
   INDEX_MAX_SLOTS,
   INDEX_MIN_SLOTS,
   INDEX_MIN_SLOTS_PER_CONNECTION,
   INDEX_SLOT_BYTES,
   indexSlotCount,
   indexSlotOffset,
-  parseConnectionId,
+  parseUuid,
   SECTION_ENTRY_BYTES,
   SECTION_KIND,
   SECTION_TABLE_OFFSET,
-  SHARD_PREFIX_BYTES,
   sectionEntryOffset,
   sectionKindName,
   uuidHigh32,
@@ -38,7 +39,7 @@ import {
 } from "./layout.js";
 
 /** `0192f3a4-b5c6-7d8e-9f01-234567890abc` under the shard `abcd`. */
-const SAMPLE_ID = "abcd_0192f3a4-b5c6-7d8e-9f01-234567890abc";
+const SAMPLE_ID = "0192f3a4-b5c6-7d8e-9f01-234567890abc";
 const SAMPLE_UUID = Uint8Array.from([
   0x01, 0x92, 0xf3, 0xa4, 0xb5, 0xc6, 0x7d, 0x8e, 0x9f, 0x01, 0x23, 0x45, 0x67, 0x89, 0x0a, 0xbc,
 ]);
@@ -51,7 +52,7 @@ describe("header constants", () => {
 
   it("fits every header field, checksum included, inside the fixed 64 bytes", () => {
     expect(HEADER_OFFSET.CHECKSUM + CHECKSUM_BYTES).toBe(HEADER_BYTES);
-    expect(HEADER_OFFSET.SHARD + SHARD_PREFIX_BYTES).toBe(HEADER_OFFSET.BUILT_AT);
+    expect(HEADER_OFFSET.RESERVED + HEADER_RESERVED_BYTES).toBe(HEADER_OFFSET.BUILT_AT);
   });
 
   it("starts the section table immediately after the header", () => {
@@ -200,41 +201,50 @@ describe("offset arithmetic", () => {
   });
 });
 
-describe("parseConnectionId", () => {
-  it("splits the shard prefix from the sixteen UUID bytes", () => {
-    const parsed = parseConnectionId(SAMPLE_ID);
-    expect(parsed.shard).toBe("abcd");
-    expect(parsed.uuid).toEqual(SAMPLE_UUID);
+describe("parseUuid", () => {
+  it("returns the sixteen UUID bytes", () => {
+    expect(parseUuid(SAMPLE_ID)).toEqual(SAMPLE_UUID);
   });
 
   it("produces the bytes the index addresses with", () => {
-    const { uuid } = parseConnectionId(SAMPLE_ID);
+    const uuid = parseUuid(SAMPLE_ID);
     expect(uuidHigh32(uuid)).toBe(0x0192f3a4);
     expect(bucketOf(uuidLow32(uuid), 8)).toBe(0xbc & 7);
   });
 
   it("handles the all-zero and all-f UUIDs", () => {
-    expect(parseConnectionId("aaaa_00000000-0000-0000-0000-000000000000").uuid).toEqual(
+    expect(parseUuid("00000000-0000-0000-0000-000000000000")).toEqual(
       new Uint8Array(CONNECTION_ID_BYTES),
     );
-    expect(parseConnectionId("zzzz_ffffffff-ffff-ffff-ffff-ffffffffffff").uuid).toEqual(
+    expect(parseUuid("ffffffff-ffff-ffff-ffff-ffffffffffff")).toEqual(
       new Uint8Array(CONNECTION_ID_BYTES).fill(0xff),
     );
   });
 
+  it("round-trips through formatUuid", () => {
+    expect(formatUuid(parseUuid(SAMPLE_ID))).toBe(SAMPLE_ID);
+  });
+
+  it("refuses to render anything that is not sixteen bytes", () => {
+    // The reader hands these bytes straight out of a record, so a wrong length
+    // means the record is malformed rather than that the id is unusual.
+    expect(() => formatUuid(new Uint8Array(15))).toThrow(BundleFormatError);
+    expect(() => formatUuid(new Uint8Array(17))).toThrow(BundleFormatError);
+  });
+
   it.each([
     ["empty", ""],
-    ["no shard", "0192f3a4-b5c6-7d8e-9f01-234567890abc"],
-    ["short shard", "abc_0192f3a4-b5c6-7d8e-9f01-234567890abc"],
-    ["long shard", "abcde_0192f3a4-b5c6-7d8e-9f01-234567890abc"],
-    ["uppercase shard", "ABCD_0192f3a4-b5c6-7d8e-9f01-234567890abc"],
-    ["uppercase uuid", "abcd_0192F3A4-b5c6-7d8e-9f01-234567890abc"],
-    ["hyphen instead of underscore", "abcd-0192f3a4-b5c6-7d8e-9f01-234567890abc"],
-    ["unhyphenated uuid", "abcd_0192f3a4b5c67d8e9f01234567890abc"],
-    ["misplaced hyphens", "abcd_0192f3a4-b5c67d8e-9f01-2345-67890abc"],
-    ["truncated uuid", "abcd_0192f3a4-b5c6-7d8e-9f01-234567890ab"],
-    ["trailing text", "abcd_0192f3a4-b5c6-7d8e-9f01-234567890abc "],
+    // A shard prefix is refused rather than stripped: the bytes returned here go
+    // into every field's associated data, so two accepted spellings of one
+    // identity would be two different bindings.
+    ["a shard prefix", "abcd_0192f3a4-b5c6-7d8e-9f01-234567890abc"],
+    ["uppercase uuid", "0192F3A4-b5c6-7d8e-9f01-234567890abc"],
+    ["unhyphenated uuid", "0192f3a4b5c67d8e9f01234567890abc"],
+    ["misplaced hyphens", "0192f3a4-b5c67d8e-9f01-2345-67890abc"],
+    ["truncated uuid", "0192f3a4-b5c6-7d8e-9f01-234567890ab"],
+    ["trailing text", "0192f3a4-b5c6-7d8e-9f01-234567890abc "],
+    ["non-hex", "0192f3g4-b5c6-7d8e-9f01-234567890abc"],
   ])("rejects %s", (_label, id) => {
-    expect(() => parseConnectionId(id)).toThrow(BundleFormatError);
+    expect(() => parseUuid(id)).toThrow(BundleFormatError);
   });
 });

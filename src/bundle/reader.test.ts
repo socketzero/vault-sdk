@@ -48,7 +48,6 @@ import { writeBundleWithChecksum } from "./writer.js";
 // A bundle builder, from the layout constants alone
 // ---------------------------------------------------------------------------
 
-const SHARD = "aaaa";
 const TEXT = new TextEncoder();
 
 interface TestField {
@@ -230,7 +229,6 @@ function buildBundle(options: BuildOptions = {}): BuiltBundle {
   view.setUint16(HEADER_OFFSET.VERSION, options.version ?? BUNDLE_VERSION, true);
   view.setUint16(HEADER_OFFSET.FLAGS, options.flags ?? 0, true);
   view.setBigUint64(HEADER_OFFSET.GENERATION, 42n, true);
-  bytes.set(TEXT.encode(options.shard ?? SHARD), HEADER_OFFSET.SHARD);
   view.setBigUint64(HEADER_OFFSET.BUILT_AT, 1_700_000_000_000n, true);
 
   // ---- section table
@@ -402,7 +400,7 @@ function fieldDescriptorAt(recordOffset: number, fieldIndex: number): number {
 const GROUP_ID = "11111111-2222-3333-4444-555555555555";
 const KEY_ID = "0123456789abcdef0123456789abcdef";
 const CONNECTION_UUID = makeUuid(0xdeadbeef, 0x00000005);
-const CONNECTION_ID = `${SHARD}_${CONNECTION_UUID}`;
+const CONNECTION_ID = CONNECTION_UUID;
 /** 60 bytes of envelope: `eph_pub(32) || nonce(12) || ct(0) || tag(16)` plus a byte. */
 const SEALED = new Uint8Array(64).fill(0x11);
 
@@ -448,7 +446,6 @@ function headerOnly(
   view.setUint16(HEADER_OFFSET.VERSION, fields.version ?? BUNDLE_VERSION, true);
   view.setUint16(HEADER_OFFSET.FLAGS, fields.flags ?? 0, true);
   view.setUint32(HEADER_OFFSET.SECTIONS, fields.sections ?? 0, true);
-  bytes.set(TEXT.encode(SHARD), HEADER_OFFSET.SHARD);
   return bytes;
 }
 
@@ -482,7 +479,7 @@ describe("readBundle: refusing what it cannot read", () => {
   });
 
   it("refuses version zero", () => {
-    expect(() => readBundle(headerOnly({ version: 0 }))).toThrow(/version is at least 1/);
+    expect(() => readBundle(headerOnly({ version: 0 }))).toThrow(UnsupportedBundleVersionError);
   });
 
   it("refuses a bundle that sets a reserved flag", () => {
@@ -666,7 +663,6 @@ describe("readBundle: the header and the section table", () => {
       version: BUNDLE_VERSION,
       flags: 0,
       generation: 42n,
-      shard: SHARD,
       builtAt: 1_700_000_000_000n,
       sections: 5,
     });
@@ -746,7 +742,7 @@ describe("lookup", () => {
 
   it("misses on an empty slot without a record", () => {
     const view = readBundle(fixture().bytes);
-    expect(view.lookup(`${SHARD}_${makeUuid(0x1, 0x2)}`)).toBeUndefined();
+    expect(view.lookup(makeUuid(0x1, 0x2))).toBeUndefined();
   });
 
   it("misses on a malformed id rather than throwing", () => {
@@ -772,7 +768,7 @@ describe("lookup", () => {
       connections: [connection(first), connection(second)],
     });
     const view = readBundle(bundle.bytes);
-    expect(view.lookup(`${SHARD}_${second}`)?.recordOffset).toBe(bundle.recordOffsets[1]);
+    expect(view.lookup(second)?.recordOffset).toBe(bundle.recordOffsets[1]);
   });
 
   it("does not trust a fingerprint match: all sixteen bytes are verified", () => {
@@ -781,7 +777,7 @@ describe("lookup", () => {
     const bundle = buildBundle({ connections: [connection(stored)] });
     const impostorHex = "0000000a00000000000000ff00000011";
     const impostor = `${impostorHex.slice(0, 8)}-${impostorHex.slice(8, 12)}-${impostorHex.slice(12, 16)}-${impostorHex.slice(16, 20)}-${impostorHex.slice(20)}`;
-    expect(readBundle(bundle.bytes).lookup(`${SHARD}_${impostor}`)).toBeUndefined();
+    expect(readBundle(bundle.bytes).lookup(impostor)).toBeUndefined();
   });
 
   it("terminates on a table with no empty slot left", () => {
@@ -876,7 +872,7 @@ describe("a fingerprint miss never reads CONN", () => {
     const stored = makeUuid(0x0000000a, 0x00000011);
     const bundle = buildBundle({ connections: [connection(stored)] });
     const view = readBundle(bundle.bytes);
-    const other = `${SHARD}_${makeUuid(0x0000000b, 0x00000011)}`;
+    const other = makeUuid(0x0000000b, 0x00000011);
 
     const { result, offsets } = recordReads(() => view.lookup(other));
     expect(result).toBeUndefined();
@@ -891,7 +887,7 @@ describe("a fingerprint miss never reads CONN", () => {
     const bundle = buildBundle({ connections: [connection(stored)] });
     const view = readBundle(bundle.bytes);
 
-    const { result, offsets } = recordReads(() => view.lookup(`${SHARD}_${stored}`));
+    const { result, offsets } = recordReads(() => view.lookup(stored));
     expect(result).toBeDefined();
     const touched = offsets.filter(
       (offset) => offset >= bundle.connOffset && offset < bundle.connOffset + bundle.connLength,
@@ -1187,7 +1183,7 @@ describe("the reader's bucket scan is constant-time", () => {
       keys: ["test", "test", "test"],
     });
     const bytes = await writeBundleWithChecksum({
-      header: { version: 1, generation: 1n, shard: "eumc", builtAt: 1n },
+      header: { version: 1, generation: 1n, builtAt: 1n },
       groups: [group.keyGroup],
       connections: [],
       filters: [],

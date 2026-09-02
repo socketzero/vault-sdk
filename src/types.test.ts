@@ -179,7 +179,7 @@ describe("errors", () => {
 
     expect(error.found).toBe(4);
     expect(error.supported).toBe(1);
-    expect(error.message).toBe("bundle version 4 is newer than the supported version 1");
+    expect(error.message).toBe("bundle version 4 is not supported; this reader implements 1");
     expect(error.name).toBe("UnsupportedBundleVersionError");
   });
 });

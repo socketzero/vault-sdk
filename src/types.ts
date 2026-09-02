@@ -256,9 +256,15 @@ export interface EnvelopeParts {
  */
 export type AssociatedData = Uint8Array;
 
-/** The identity a credential field's AAD binds, in that order. */
+/**
+ * The identity a credential field's AAD binds, in that order.
+ *
+ * The connection is its raw sixteen UUID bytes rather than a rendered id: the
+ * rendering is a presentation choice, and binding one would make the AAD depend
+ * on how the id happened to be spelled.
+ */
 export interface FieldIdentity {
-  readonly connectionId: string;
+  readonly connectionUuid: Uint8Array;
   readonly fieldName: string;
 }
 
@@ -331,8 +337,6 @@ export interface BundleHeader {
   readonly flags: number;
   /** Monotonic per shard, from the compiler. */
   readonly generation: bigint;
-  /** The four-character shard prefix, ASCII. */
-  readonly shard: string;
   /** Unix millis. Advisory only. */
   readonly builtAt: bigint;
   /** Count of section-table descriptors that follow. */
@@ -491,14 +495,15 @@ export type VisibleValue = string | number | boolean;
 export interface BundleHeaderInput {
   readonly version: number;
   readonly generation: bigint;
-  /** Exactly four lowercase ASCII letters. */
-  readonly shard: string;
   /** Unix millis. */
   readonly builtAt: bigint;
 }
 
 export interface ConnectionInput {
-  /** Shard prefix then UUIDv7. Its low 32 bits address the bucket. */
+  /**
+   * A canonical lowercase UUID — no shard prefix. Its low 32 bits address the
+   * index bucket, and its raw bytes are bound into every field's AAD.
+   */
   readonly connectionId: string;
   readonly groupId: string;
   readonly target: string;
@@ -588,12 +593,15 @@ export class BundleFormatError extends VaultError {
   }
 }
 
-/** A higher `version` than this reader knows. Refuse the whole bundle. */
+/**
+ * A `version` this reader does not implement — higher or lower. Refuse the whole
+ * bundle: partial understanding of a security artifact is worse than none.
+ */
 export class UnsupportedBundleVersionError extends VaultError {
   readonly found: number;
   readonly supported: number;
   constructor(found: number, supported: number) {
-    super(`bundle version ${found} is newer than the supported version ${supported}`);
+    super(`bundle version ${found} is not supported; this reader implements ${supported}`);
     this.name = "UnsupportedBundleVersionError";
     this.found = found;
     this.supported = supported;

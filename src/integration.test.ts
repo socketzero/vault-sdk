@@ -13,7 +13,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { generateApiKey, parseApiKey } from "./api-key.js";
-import { FIELD_DESCRIPTOR_OFFSET, HEADER_OFFSET } from "./bundle/layout.js";
+import { FIELD_DESCRIPTOR_OFFSET, HEADER_OFFSET, parseUuid } from "./bundle/layout.js";
 import { readBundle } from "./bundle/reader.js";
 import {
   computeChecksum,
@@ -47,7 +47,6 @@ import {
 
 const TENANT = "tnt_01j9x4m2q8";
 const OTHER_TENANT = "tnt_01j9x4m2q9";
-const SHARD = "eumc";
 
 /** `high32` then eight zero bytes then `low32`, formatted 8-4-4-4-12. */
 function makeUuid(high32: number, low32: number): string {
@@ -155,7 +154,7 @@ describe("a key group wrapped under two API keys", () => {
 // ---------------------------------------------------------------------------
 
 describe("a credential sealed to a group and opened with the unwrapped private half", () => {
-  const CONNECTION = `${SHARD}_${makeUuid(0x11111111, 0x00000010)}`;
+  const CONNECTION = makeUuid(0x11111111, 0x00000010);
   const SECRET = "hunter2-éè-🔑";
 
   it("round-trips through wrap, unwrap, seal and open", async () => {
@@ -168,7 +167,7 @@ describe("a credential sealed to a group and opened with the unwrapped private h
     }
 
     // The sealer holds only the public half. Nothing in this block has a secret.
-    const aad = fieldAssociatedData(CONNECTION, "password");
+    const aad = fieldAssociatedData(parseUuid(CONNECTION), "password");
     const envelope = await seal(utf8Encode(SECRET), group.publicKey, aad);
     expect(envelope.startsWith("x25519-hkdf-aesgcm:")).toBe(true);
 
@@ -184,7 +183,7 @@ describe("a credential sealed to a group and opened with the unwrapped private h
 
   it("keeps the envelope exactly 60 bytes larger than the secret", async () => {
     const group = await generateGroup();
-    const aad = fieldAssociatedData(CONNECTION, "password");
+    const aad = fieldAssociatedData(parseUuid(CONNECTION), "password");
     for (const length of [0, 1, 15, 16, 17, 4096]) {
       const envelope = await seal(new Uint8Array(length), group.publicKey, aad);
       const payload = envelope.slice(envelope.indexOf(":") + 1);
@@ -199,15 +198,15 @@ describe("a credential sealed to a group and opened with the unwrapped private h
   it("refuses a field moved to another name, another connection or another group", async () => {
     const group = await generateGroup();
     const other = await generateGroup();
-    const aad = fieldAssociatedData(CONNECTION, "password");
+    const aad = fieldAssociatedData(parseUuid(CONNECTION), "password");
     const envelope = await seal(utf8Encode(SECRET), group.publicKey, aad);
 
-    const moved = fieldAssociatedData(CONNECTION, "api_key");
+    const moved = fieldAssociatedData(parseUuid(CONNECTION), "api_key");
     await expect(open(envelope, group.privateKey, moved, group.publicKey)).rejects.toBeInstanceOf(
       VaultDecryptionError,
     );
 
-    const elsewhere = fieldAssociatedData(`${SHARD}_${makeUuid(0x22222222, 0x11)}`, "password");
+    const elsewhere = fieldAssociatedData(parseUuid(makeUuid(0x22222222, 0x11)), "password");
     await expect(
       open(envelope, group.privateKey, elsewhere, group.publicKey),
     ).rejects.toBeInstanceOf(VaultDecryptionError);
@@ -262,7 +261,7 @@ async function buildFixture(): Promise<Fixture> {
   const secrets = new Map<string, string>();
   const connections: ConnectionInput[] = [];
   for (const spec of CONNECTIONS) {
-    const connectionId = `${SHARD}_${spec.uuid}`;
+    const connectionId = spec.uuid;
     const group = groups[spec.group];
     if (group === undefined) {
       throw new Error("fixture names a group that was not built");
@@ -274,7 +273,7 @@ async function buildFixture(): Promise<Fixture> {
       sealed[fieldName] = await seal(
         utf8Encode(secret),
         group.publicKey,
-        fieldAssociatedData(connectionId, fieldName),
+        fieldAssociatedData(parseUuid(connectionId), fieldName),
       );
     }
     connections.push({
@@ -290,7 +289,7 @@ async function buildFixture(): Promise<Fixture> {
 
   return {
     input: {
-      header: { version: 1, generation: 42n, shard: SHARD, builtAt: 1_725_000_000_000n },
+      header: { version: 1, generation: 42n, builtAt: 1_725_000_000_000n },
       groups: groups.map((group) => ({
         groupId: group.groupId,
         publicKey: group.publicKey,
@@ -312,7 +311,6 @@ describe("a bundle written by the writer and read in place by the reader", () =>
     const bundle = readBundle(bytes);
 
     expect(bundle.header.magic).toBe("S0BUNDLE");
-    expect(bundle.header.shard).toBe(SHARD);
     expect(bundle.header.generation).toBe(42n);
     expect(bundle.connectionCount).toBe(CONNECTIONS.length);
     expect(bundle.groupCount).toBe(2);
@@ -324,7 +322,7 @@ describe("a bundle written by the writer and read in place by the reader", () =>
     const bundle = readBundle(writeBundle(fixture.input));
 
     for (const spec of CONNECTIONS) {
-      const record = bundle.lookup(`${SHARD}_${spec.uuid}`);
+      const record = bundle.lookup(spec.uuid);
       expect(record?.target()).toBe(spec.target);
       expect(record?.groupIndex).toBe(spec.group);
       expect(record?.visible("region")).toBe("eu");
@@ -336,8 +334,8 @@ describe("a bundle written by the writer and read in place by the reader", () =>
     }
 
     // The two colliding ids resolved to different records, not to one another.
-    const first = bundle.lookup(`${SHARD}_${CONNECTIONS[0].uuid}`);
-    const collider = bundle.lookup(`${SHARD}_${CONNECTIONS[3].uuid}`);
+    const first = bundle.lookup(CONNECTIONS[0].uuid);
+    const collider = bundle.lookup(CONNECTIONS[3].uuid);
     expect(first?.recordOffset).not.toBe(collider?.recordOffset);
   });
 
@@ -379,7 +377,7 @@ describe("a bundle written by the writer and read in place by the reader", () =>
     const bundle = readBundle(writeBundle(fixture.input));
 
     for (const spec of CONNECTIONS) {
-      const connectionId = `${SHARD}_${spec.uuid}`;
+      const connectionId = spec.uuid;
       const record = bundle.lookup(connectionId);
       if (record === undefined) {
         throw new Error(`${connectionId} was not in the bundle`);
@@ -416,7 +414,7 @@ describe("a bundle written by the writer and read in place by the reader", () =>
         const opened = await open(
           record.fieldBytes(descriptor),
           privateKey,
-          fieldAssociatedData(connectionId, fieldName),
+          fieldAssociatedData(parseUuid(connectionId), fieldName),
           groupView.publicKey(),
         );
         expect(utf8Decode(opened)).toBe(fixture.secrets.get(`${connectionId}/${fieldName}`));
@@ -431,7 +429,7 @@ describe("a bundle written by the writer and read in place by the reader", () =>
     const fixture = await buildFixture();
     const bundle = readBundle(writeBundle(fixture.input));
     const spec = CONNECTIONS[0];
-    const connectionId = `${SHARD}_${spec.uuid}`;
+    const connectionId = spec.uuid;
     const record = bundle.lookup(connectionId);
     const written = fixture.input.connections[0];
     if (record === undefined || written === undefined) {
@@ -454,7 +452,7 @@ describe("a bundle written by the writer and read in place by the reader", () =>
     const buffer = writeBundle(fixture.input);
     const bundle = readBundle(buffer);
     const spec = CONNECTIONS[0];
-    const connectionId = `${SHARD}_${spec.uuid}`;
+    const connectionId = spec.uuid;
     const expected = fixture.secrets.get(`${connectionId}/password`);
 
     const record = bundle.lookup(connectionId);
@@ -467,7 +465,7 @@ describe("a bundle written by the writer and read in place by the reader", () =>
     const opened = await open(
       record.fieldBytes(sealedDescriptor),
       group.privateKey,
-      fieldAssociatedData(connectionId, "password"),
+      fieldAssociatedData(parseUuid(connectionId), "password"),
       group.publicKey,
     );
 
@@ -606,7 +604,7 @@ describe("a lookup that misses", () => {
     // Same bucket as the first connection — the low 32 bits are identical — so
     // the slot is occupied and only the fingerprint can refuse it. Anything
     // less deliberate would land on an empty slot and prove nothing.
-    const absent = `${SHARD}_${makeUuid(0xdeadbeef, 0x00000101)}`;
+    const absent = makeUuid(0xdeadbeef, 0x00000101);
     const miss = recordReads(buffer, () => bundle.lookup(absent));
     expect(miss.result).toBeUndefined();
     expect(miss.offsets.length).toBeGreaterThan(0);
@@ -614,7 +612,7 @@ describe("a lookup that misses", () => {
 
     // The positive control: without it the assertion above could pass simply by
     // never reading anything.
-    const hit = recordReads(buffer, () => bundle.lookup(`${SHARD}_${CONNECTIONS[0].uuid}`));
+    const hit = recordReads(buffer, () => bundle.lookup(CONNECTIONS[0].uuid));
     expect(hit.result).toBeDefined();
     expect(hit.offsets.filter(inConn).length).toBeGreaterThan(0);
   });
@@ -631,9 +629,7 @@ describe("a lookup that misses", () => {
     const bundle = readBundle(writeBundle(fixture.input));
     expect(bundle.groupById(makeUuid(0xffffffff, 0xffffffff))).toBeUndefined();
     expect(bundle.group(0)?.findBucketEntry("0".repeat(32))).toBeUndefined();
-    expect(
-      bundle.lookup(`${SHARD}_${CONNECTIONS[0].uuid}`)?.field("client_secret"),
-    ).toBeUndefined();
+    expect(bundle.lookup(CONNECTIONS[0].uuid)?.field("client_secret")).toBeUndefined();
   });
 });
 
@@ -664,7 +660,7 @@ describe("a bundle forged in the store", () => {
   it("refuses one whose field arrives already open, credential injection and all", async () => {
     const fixture = await buildFixture();
     const buffer = await writeBundleWithChecksum(fixture.input);
-    const connectionId = `${SHARD}_${CONNECTIONS[0].uuid}`;
+    const connectionId = CONNECTIONS[0].uuid;
 
     // Read the pristine bundle once, purely to learn where the slot is.
     const descriptor = readBundle(buffer).lookup(connectionId)?.field("api_key");
@@ -695,7 +691,7 @@ describe("a bundle forged in the store", () => {
   it("refuses one whose field claims more plaintext than its slot holds", async () => {
     const fixture = await buildFixture();
     const buffer = await writeBundleWithChecksum(fixture.input);
-    const connectionId = `${SHARD}_${CONNECTIONS[0].uuid}`;
+    const connectionId = CONNECTIONS[0].uuid;
     const descriptor = readBundle(buffer).lookup(connectionId)?.field("password");
     if (descriptor === undefined) {
       throw new Error("the fixture's first connection has no password field");
@@ -721,7 +717,7 @@ describe("a bundle forged in the store", () => {
     const fixture = await buildFixture();
     const buffer = writeBundle(fixture.input);
     const bundle = readBundle(buffer);
-    const connectionId = `${SHARD}_${CONNECTIONS[0].uuid}`;
+    const connectionId = CONNECTIONS[0].uuid;
     const record = bundle.lookup(connectionId);
     const sealed = record?.field("password");
     const group = fixture.groups[CONNECTIONS[0].group];
@@ -732,7 +728,7 @@ describe("a bundle forged in the store", () => {
     const plaintext = await open(
       record.fieldBytes(sealed),
       group.privateKey,
-      fieldAssociatedData(connectionId, "password"),
+      fieldAssociatedData(parseUuid(connectionId), "password"),
       group.publicKey,
     );
     const live = bundle.writeBack(sealed, plaintext);
@@ -758,8 +754,8 @@ describe("a bundle forged in the store", () => {
 // ---------------------------------------------------------------------------
 
 describe("rotating a key group after a key is removed", () => {
-  const CONNECTION_A = `${SHARD}_${makeUuid(0x31313131, 0x00000301)}`;
-  const CONNECTION_B = `${SHARD}_${makeUuid(0x32323232, 0x00000302)}`;
+  const CONNECTION_A = makeUuid(0x31313131, 0x00000301);
+  const CONNECTION_B = makeUuid(0x32323232, 0x00000302);
   const PLAINTEXTS: ReadonlyArray<readonly [string, string, string]> = [
     [CONNECTION_A, "password", "hunter2-éè-🔑"],
     [CONNECTION_A, "api_key", "sk-a-0123456789"],
@@ -783,13 +779,13 @@ describe("rotating a key group after a key is removed", () => {
 
     const fields: SealedField[] = await Promise.all(
       PLAINTEXTS.map(async ([connectionId, fieldName, secret]): Promise<SealedField> => {
-        const identity = { connectionId, fieldName };
+        const identity = { connectionUuid: parseUuid(connectionId), fieldName };
         return {
           identity,
           envelope: await seal(
             utf8Encode(secret),
             old.publicKey,
-            fieldAssociatedData(connectionId, fieldName),
+            fieldAssociatedData(parseUuid(connectionId), fieldName),
           ),
         };
       }),
@@ -832,12 +828,12 @@ describe("rotating a key group after a key is removed", () => {
         }
         // The identity is carried through unchanged: rotation changes the
         // recipient, never what the envelope is bound to.
-        expect(field.identity.connectionId).toBe(expected[0]);
+        expect(field.identity.connectionUuid).toEqual(parseUuid(expected[0]));
         expect(field.identity.fieldName).toBe(expected[1]);
         const opened = await open(
           field.envelope,
           privateKey,
-          fieldAssociatedData(expected[0], expected[1]),
+          fieldAssociatedData(parseUuid(expected[0]), expected[1]),
           rotated.publicKey,
         );
         expect(utf8Decode(opened)).toBe(expected[2]);
@@ -854,11 +850,11 @@ describe("rotating a key group after a key is removed", () => {
     const fields: SealedField[] = await Promise.all(
       PLAINTEXTS.map(async ([connectionId, fieldName, secret]): Promise<SealedField> => {
         return {
-          identity: { connectionId, fieldName },
+          identity: { connectionUuid: parseUuid(connectionId), fieldName },
           envelope: await seal(
             utf8Encode(secret),
             old.publicKey,
-            fieldAssociatedData(connectionId, fieldName),
+            fieldAssociatedData(parseUuid(connectionId), fieldName),
           ),
         };
       }),
@@ -867,7 +863,7 @@ describe("rotating a key group after a key is removed", () => {
     const rotated = await rotateGroup(old.privateKey, fields, [key.bytes], TENANT, GROUP_ONE);
 
     for (const field of rotated.fields) {
-      const aad = fieldAssociatedData(field.identity.connectionId, field.identity.fieldName);
+      const aad = fieldAssociatedData(field.identity.connectionUuid, field.identity.fieldName);
       // Both with and without the stale public half handed in: the salt is
       // wrong either way and the tag simply fails.
       await expect(open(field.envelope, old.privateKey, aad, old.publicKey)).rejects.toBeInstanceOf(
@@ -888,7 +884,7 @@ describe("rotating a key group after a key is removed", () => {
       const opened = await open(
         field.envelope,
         rotated.privateKey,
-        fieldAssociatedData(expected[0], expected[1]),
+        fieldAssociatedData(parseUuid(expected[0]), expected[1]),
         rotated.publicKey,
       );
       expect(utf8Decode(opened)).toBe(expected[2]);
@@ -906,23 +902,23 @@ describe("rotating a key group after a key is removed", () => {
     const old = await generateGroup();
     const stranger = await generateGroup();
     const key = generateApiKey("live");
-    const identity = { connectionId: CONNECTION_A, fieldName: "password" };
+    const identity = { connectionUuid: parseUuid(CONNECTION_A), fieldName: "password" };
     const fields: SealedField[] = [
       {
         identity,
         envelope: await seal(
           utf8Encode("openable"),
           old.publicKey,
-          fieldAssociatedData(identity.connectionId, identity.fieldName),
+          fieldAssociatedData(identity.connectionUuid, identity.fieldName),
         ),
       },
       {
         // Sealed to somebody else's group: the old private half cannot open it.
-        identity: { connectionId: CONNECTION_B, fieldName: "password" },
+        identity: { connectionUuid: parseUuid(CONNECTION_B), fieldName: "password" },
         envelope: await seal(
           utf8Encode("not openable"),
           stranger.publicKey,
-          fieldAssociatedData(CONNECTION_B, "password"),
+          fieldAssociatedData(parseUuid(CONNECTION_B), "password"),
         ),
       },
     ];
@@ -938,26 +934,15 @@ describe("rotating a key group after a key is removed", () => {
 // ---------------------------------------------------------------------------
 
 describe("associated data that plain concatenation would have collided", () => {
-  it('refuses ("conn", "1password") opened as ("conn1", "password")', async () => {
-    const group = await generateGroup();
-    const sealedFor = fieldAssociatedData("conn", "1password");
-    const shifted = fieldAssociatedData("conn1", "password");
-
+  it('refuses ("grp", "10a1b") opened as ("grp1", "0a1b")', async () => {
     // Plain concatenation is the defect the length prefix exists to close: both
-    // pairs produce the identical byte string "conn1password".
+    // pairs produce the identical byte string "grp10a1b". The field AAD can no
+    // longer express this collision at all — its first component is a fixed
+    // sixteen bytes — so the property is stated where two rendered identifiers
+    // still meet: the bucket entry.
     const concatenated = (a: string, b: string): Uint8Array => utf8Encode(a + b);
-    expect(concatenated("conn", "1password")).toEqual(concatenated("conn1", "password"));
-    // The length-prefixed construction does not collide.
-    expect(sealedFor).not.toEqual(shifted);
-
-    const envelope = await seal(utf8Encode("hunter2"), group.publicKey, sealedFor);
-    await expect(open(envelope, group.privateKey, shifted, group.publicKey)).rejects.toBeInstanceOf(
-      VaultDecryptionError,
-    );
-    // The positive control: under the AAD it was actually sealed with, it opens.
-    expect(utf8Decode(await open(envelope, group.privateKey, sealedFor, group.publicKey))).toBe(
-      "hunter2",
-    );
+    expect(concatenated("grp", "10a1b")).toEqual(concatenated("grp1", "0a1b"));
+    expect(bucketAssociatedData("grp", "10a1b")).not.toEqual(bucketAssociatedData("grp1", "0a1b"));
   });
 
   it('refuses a bucket entry sealed for ("grp", "10a1b") opened as ("grp1", "0a1b")', async () => {

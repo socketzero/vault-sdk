@@ -31,7 +31,7 @@ export const BUNDLE_MAGIC = "S0BUNDLE";
 export const BUNDLE_MAGIC_BYTES: Uint8Array = new Uint8Array([
   0x53, 0x30, 0x42, 0x55, 0x4e, 0x44, 0x4c, 0x45,
 ]);
-/** The version this build writes and is the highest it will read. */
+/** The one version this build writes and the only one it reads. */
 export const BUNDLE_VERSION = 1;
 /** Fixed. */
 export const HEADER_BYTES = 64;
@@ -42,7 +42,7 @@ export const HEADER_OFFSET = {
   VERSION: 8, // uint16
   FLAGS: 10, // uint16, reserved, must be zero
   GENERATION: 12, // uint64, monotonic, from the compiler
-  SHARD: 20, // 4 bytes, ASCII, the shard prefix
+  RESERVED: 20, // uint32, reserved; must be zero
   BUILT_AT: 24, // uint64, unix millis, advisory only
   SECTIONS: 32, // uint32, count of section-table descriptors
   CHECKSUM: 36, // 28 bytes, over everything after the header
@@ -57,8 +57,8 @@ export const CHECKSUM_BYTES = 28;
  * because a write-back deliberately invalidates it.
  */
 export const CHECKSUM_ALGORITHM = "SHA-256";
-/** The shard prefix is exactly four ASCII letters. */
-export const SHARD_PREFIX_BYTES = 4;
+/** Four reserved header bytes. Must be zero. */
+export const HEADER_RESERVED_BYTES = 4;
 
 // ---------------------------------------------------------------------------
 // Section table
@@ -344,31 +344,40 @@ export function filtEntryOffset(filtSectionOffset: number, filterIndex: number):
   return filtSectionOffset + filterIndex * FILT_ENTRY_BYTES;
 }
 
-/** `<shard>_<canonical uuid>`, the only form a connection id is ever written in. */
-const CONNECTION_ID_PATTERN =
-  /^([a-z]{4})_([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})$/;
+/**
+ * The canonical lowercase UUID, and the only form a connection id takes.
+ *
+ * A shard prefix is a routing concern of whatever dispatches a request to a
+ * shard; by the time the bundle is being read the routing has already happened,
+ * so the prefix is refused here rather than parsed and ignored — accepting it
+ * silently would leave two spellings of one identity, and the identity is bound
+ * into the associated data of every field.
+ */
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
-/** Split a `<shard>_<uuid>` connection id into its prefix and sixteen UUID bytes. */
-export function parseConnectionId(connectionId: string): {
-  shard: string;
-  uuid: Uint8Array;
-} {
-  const match = CONNECTION_ID_PATTERN.exec(connectionId);
-  if (match === null) {
+/** The sixteen bytes of a canonical UUID. */
+export function parseUuid(uuid: string): Uint8Array {
+  if (!UUID_PATTERN.test(uuid)) {
     throw new BundleFormatError(
-      "a connection id is four lowercase letters, an underscore, then a UUID",
+      `a connection id is a canonical lowercase UUID, got ${JSON.stringify(uuid)}`,
     );
   }
-  // Group 1 is the shard; groups 2..6 are the UUID's hex runs, which concatenate
-  // to exactly 32 characters. `replaceAll` on the tail is simpler than joining
-  // the groups back up and cannot reintroduce a separator the pattern rejected.
-  const shard = connectionId.slice(0, SHARD_PREFIX_BYTES);
-  const hex = connectionId.slice(SHARD_PREFIX_BYTES + 1).replaceAll("-", "");
-  const uuid = new Uint8Array(CONNECTION_ID_BYTES);
+  const hex = uuid.replaceAll("-", "");
+  const bytes = new Uint8Array(CONNECTION_ID_BYTES);
   for (let i = 0; i < CONNECTION_ID_BYTES; i += 1) {
-    uuid[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
   }
-  return { shard, uuid };
+  return bytes;
+}
+
+/** The canonical 8-4-4-4-12 rendering of sixteen UUID bytes. */
+export function formatUuid(uuid: Uint8Array): string {
+  if (uuid.byteLength !== CONNECTION_ID_BYTES) {
+    throw new BundleFormatError(`a connection id is ${CONNECTION_ID_BYTES} bytes`);
+  }
+  let hex = "";
+  for (const byte of uuid) hex += byte.toString(16).padStart(2, "0");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 /** Printable ASCII, so a corrupt kind cannot smuggle control characters into a log. */

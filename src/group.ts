@@ -338,7 +338,7 @@ export async function rotateGroup(
   const [resealed, bucket] = await Promise.all([
     Promise.all(
       fields.map(async (field): Promise<SealedField> => {
-        const aad = fieldAssociatedData(field.identity.connectionId, field.identity.fieldName);
+        const aad = fieldAssociatedData(field.identity.connectionUuid, field.identity.fieldName);
         const plaintext = await open(field.envelope, oldPrivateKey, aad, oldPublicKey);
         return { identity: field.identity, envelope: await seal(plaintext, publicKey, aad) };
       }),

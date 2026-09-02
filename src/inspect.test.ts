@@ -22,7 +22,7 @@ import {
   SECTION_KINDS,
   verifyBundle,
 } from "./inspect.js";
-import { connectionId, flipByte, makeFixture, SHARD } from "./lifecycle.fixture.js";
+import { connectionId, flipByte, makeFixture } from "./lifecycle.fixture.js";
 import { FieldState } from "./types.js";
 
 /** JSON.parse(JSON.stringify(x)) — proves the dump really is JSON-safe. */
@@ -38,7 +38,6 @@ describe("a dump of a whole bundle", () => {
     expect(dump.format).toBe(DUMP_FORMAT);
     expect(dump.formatVersion).toBe(DUMP_FORMAT_VERSION);
     expect(dump.header.magic).toBe("S0BUNDLE");
-    expect(dump.header.shard).toBe(SHARD);
     // JSON has no uint64, so a generation survives as a string or not at all.
     expect(dump.header.generation).toBe("47");
     expect(dump.header.builtAt).toBe(input.header.builtAt.toString());
@@ -471,7 +470,7 @@ describe("verifyBundle", () => {
 
   it("reports an empty generation as ok", async () => {
     const bytes = await writeBundleWithChecksum({
-      header: { version: 1, generation: 1n, shard: SHARD, builtAt: 1n },
+      header: { version: 1, generation: 1n, builtAt: 1n },
       groups: [],
       connections: [],
       filters: [],
@@ -483,7 +482,7 @@ describe("verifyBundle", () => {
 
   it("round-trips an empty generation too", async () => {
     const input = {
-      header: { version: 1, generation: 1n, shard: SHARD, builtAt: 1n },
+      header: { version: 1, generation: 1n, builtAt: 1n },
       groups: [],
       connections: [],
       filters: [],

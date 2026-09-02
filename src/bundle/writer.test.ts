@@ -52,7 +52,6 @@ import {
 // Fixtures
 // ---------------------------------------------------------------------------
 
-const SHARD = "abcd";
 const GROUP_A = "11111111-2222-4333-8444-555555555555";
 const GROUP_B = "99999999-8888-4777-8666-555555555555";
 const KEY_ID_A = "0123456789abcdef0123456789abcdef";
@@ -67,7 +66,7 @@ const UUID_ONE = uuid("00000001", "00000010");
 const UUID_TWO = uuid("00000002", "00000020");
 
 function connectionId(id: string): string {
-  return `${SHARD}_${id}`;
+  return id;
 }
 
 /** `plaintextLength + 60`, so the payload is a plausible envelope. */
@@ -103,7 +102,7 @@ function connection(overrides: Partial<ConnectionInput> = {}): ConnectionInput {
 
 function bundle(overrides: Partial<BundleInput> = {}): BundleInput {
   return {
-    header: { version: 1, generation: 7n, shard: SHARD, builtAt: 1_700_000_000_000n },
+    header: { version: 1, generation: 7n, builtAt: 1_700_000_000_000n },
     groups: [group(GROUP_A)],
     connections: [connection()],
     filters: [],
@@ -152,7 +151,7 @@ function section(buffer: Uint8Array, kind: number): Section {
 function lookup(buffer: Uint8Array, id: string): number | undefined {
   const view = viewOf(buffer);
   const indx = section(buffer, SECTION_KIND.INDX);
-  const uuidBytes = hexDecode(id.slice(5).replaceAll("-", ""));
+  const uuidBytes = hexDecode(id.replaceAll("-", ""));
   const idView = viewOf(uuidBytes);
   const low = idView.getUint32(12, false);
   const high = idView.getUint32(0, false);
@@ -285,7 +284,9 @@ describe("the header", () => {
     expect(view.getUint16(HEADER_OFFSET.VERSION, true)).toBe(1);
     expect(view.getUint16(HEADER_OFFSET.FLAGS, true)).toBe(0);
     expect(view.getBigUint64(HEADER_OFFSET.GENERATION, true)).toBe(7n);
-    expect(stringAt(buffer, HEADER_OFFSET.SHARD, 4)).toBe(SHARD);
+    expect(Array.from(buffer.subarray(HEADER_OFFSET.RESERVED, HEADER_OFFSET.RESERVED + 4))).toEqual(
+      [0, 0, 0, 0],
+    );
     expect(view.getBigUint64(HEADER_OFFSET.BUILT_AT, true)).toBe(1_700_000_000_000n);
     expect(view.getUint32(HEADER_OFFSET.SECTIONS, true)).toBe(5);
   });
@@ -299,14 +300,19 @@ describe("the header", () => {
     expect(checksum.every((byte) => byte === 0)).toBe(true);
   });
 
-  it("writes the version it is handed rather than the one it prefers", () => {
-    const buffer = writeBundle(bundle({ header: { ...bundle().header, version: 2 } }));
-    expect(viewOf(buffer).getUint16(HEADER_OFFSET.VERSION, true)).toBe(2);
+  it("refuses to stamp a version it does not implement", () => {
+    // One layout, one number. A caller-chosen version would let the writer emit
+    // a bundle no reader accepts, and the mismatch would only surface as a
+    // refusal at load on some other machine.
+    expect(() => writeBundle(bundle({ header: { ...bundle().header, version: 2 } }))).toThrow(
+      /bundle version must be 1/,
+    );
+    expect(() => writeBundle(bundle({ header: { ...bundle().header, version: 0 } }))).toThrow(
+      RangeError,
+    );
   });
 
   it.each([
-    ["a shard that is not four letters", { shard: "ab" }],
-    ["an uppercase shard", { shard: "ABCD" }],
     ["a version below one", { version: 0 }],
     ["a fractional version", { version: 1.5 }],
     ["a version past a uint16", { version: 70000 }],
@@ -324,23 +330,6 @@ describe("the header", () => {
     expect(() => writeBundle(bundle({ header: { ...bundle().header, ...overrides } }))).toThrow(
       RangeError,
     );
-  });
-});
-
-describe("a connection's shard must match the header", () => {
-  it("refuses a connection id whose shard prefix differs from the header shard", () => {
-    // The prefix is not stored per record. A mismatch would silently re-home the
-    // connection under the header's shard, leaving every field's AAD bound to the
-    // original id and unopenable forever. Refuse it at publish time instead.
-    const mismatched = connection({ connectionId: `wxyz_${UUID_ONE}` });
-    expect(() => writeBundle(bundle({ connections: [mismatched] }))).toThrow(RangeError);
-    expect(() => writeBundle(bundle({ connections: [mismatched] }))).toThrow(
-      /is in shard "wxyz", but the bundle is shard "abcd"/,
-    );
-  });
-
-  it("accepts a connection id whose shard matches the header", () => {
-    expect(() => writeBundle(bundle())).not.toThrow();
   });
 });
 

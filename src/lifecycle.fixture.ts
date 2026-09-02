@@ -9,6 +9,7 @@
  */
 
 import { generateApiKey } from "./api-key.js";
+import { parseUuid } from "./bundle/layout.js";
 import { writeBundleWithChecksum } from "./bundle/writer.js";
 import { utf8Encode } from "./encoding.js";
 import { fieldAssociatedData, seal } from "./envelope.js";
@@ -33,8 +34,9 @@ export function makeUuid(high32: number, low32: number): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-export function connectionId(low32: number, shard = SHARD): string {
-  return `${shard}_${makeUuid(0x0192a7c1, low32)}`;
+/** A connection id is a bare canonical UUID; shards are not in the format. */
+export function connectionId(low32: number): string {
+  return makeUuid(0x0192a7c1, low32);
 }
 
 /** What one group looks like once the control plane has finished with it. */
@@ -85,7 +87,7 @@ export async function makeConnection(spec: ConnectionSpec): Promise<ConnectionIn
     sealed[name] = await seal(
       utf8Encode(value),
       spec.group.pair.publicKey,
-      fieldAssociatedData(spec.connectionId, name),
+      fieldAssociatedData(parseUuid(spec.connectionId), name),
     );
   }
   return {
@@ -145,7 +147,7 @@ export async function makeFixture(tenantId = TENANT): Promise<Fixture> {
   ];
 
   const input: BundleInput = {
-    header: { version: 1, generation: 47n, shard: SHARD, builtAt: 1_726_000_000_000n },
+    header: { version: 1, generation: 47n, builtAt: 1_726_000_000_000n },
     groups: [alpha.keyGroup, beta.keyGroup],
     connections,
     filters: [{ kind: 1, args: utf8Encode("allow:GET,POST") }],

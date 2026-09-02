@@ -26,6 +26,7 @@ import {
   BUCKET_ENTRY_BYTES,
   BUCKET_ENTRY_OFFSET,
   BUNDLE_MAGIC_BYTES,
+  BUNDLE_VERSION,
   bucketEntryOffset,
   bucketOf,
   CHECKSUM_ALGORITHM,
@@ -44,18 +45,18 @@ import {
   grupRecordOffset,
   HEADER_BYTES,
   HEADER_OFFSET,
+  HEADER_RESERVED_BYTES,
   INDEX_EMPTY_SLOT,
   INDEX_SLOT_BYTES,
   INDEX_SLOT_OFFSET,
   indexSlotCount,
   indexSlotOffset,
   KEY_ID_BYTES,
-  parseConnectionId,
+  parseUuid,
   SECTION_ENTRY_BYTES,
   SECTION_ENTRY_OFFSET,
   SECTION_KIND,
   SECTION_TABLE_OFFSET,
-  SHARD_PREFIX_BYTES,
   sectionEntryOffset,
   uuidHigh32,
   uuidLow32,
@@ -105,7 +106,6 @@ const MAX_UINT16 = 0xffff;
 const MAX_UINT32 = 0xffffffff;
 const MAX_UINT64 = 2n ** 64n - 1n;
 
-const SHARD_PATTERN = /^[a-z]{4}$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const KEY_ID_PATTERN = /^[0-9a-f]{32}$/;
 
@@ -451,7 +451,6 @@ function planConnections(
       connRecordOffset(connSectionOffset, index),
       groupIndices,
       input.filters.length,
-      input.header.shard,
       arena,
     );
   });
@@ -462,7 +461,6 @@ function planConnection(
   recordOffset: number,
   groupIndices: ReadonlyMap<string, number>,
   filterCount: number,
-  shard: string,
   arena: Arena,
 ): PlannedConnection {
   const groupIndex = groupIndices.get(connection.groupId);
@@ -472,17 +470,10 @@ function planConnection(
     );
   }
 
-  // The connection id's shard prefix is not stored per record — only the header
-  // shard is. A mismatch here would silently re-home the connection under the
-  // header's shard, so `lookup` finds it but every field's AAD was bound to the
-  // original id and can never open again: permanent, silent data loss discovered
-  // long after the plaintext is gone. Refuse it at publish time instead.
-  const parsedId = parseConnectionId(connection.connectionId);
-  if (parsedId.shard !== shard) {
-    throw new RangeError(
-      `connection ${connection.connectionId} is in shard "${parsedId.shard}", but the bundle is shard "${shard}"`,
-    );
-  }
+  // Throws unless the id is a canonical UUID. A shard prefix is refused rather
+  // than stripped: the bytes below go into every field's associated data, so two
+  // accepted spellings of one identity would be two different bindings.
+  const connectionUuid = parseUuid(connection.connectionId);
 
   const sealed = Object.entries(connection.sealed);
   if (sealed.length > CONN_MAX_FIELDS) {
@@ -494,7 +485,7 @@ function planConnection(
   const visible = encodeVisible(connection);
 
   return {
-    uuid: parsedId.uuid,
+    uuid: connectionUuid,
     recordOffset,
     groupIndex,
     targetOffset: arenaIntern(arena, target),
@@ -712,11 +703,10 @@ function encodeExpiresAt(connection: ConnectionInput): bigint {
 // ---------------------------------------------------------------------------
 
 function assertHeader(header: BundleHeaderInput): void {
-  if (!SHARD_PATTERN.test(header.shard)) {
-    throw new RangeError(`shard must be four lowercase letters, got "${header.shard}"`);
-  }
-  if (!Number.isInteger(header.version) || header.version < 1 || header.version > MAX_UINT16) {
-    throw new RangeError(`bundle version must be in [1, ${MAX_UINT16}], got ${header.version}`);
+  // The writer implements one layout, so it may only stamp that layout's number.
+  // Letting a caller pick would let them emit a bundle no reader accepts.
+  if (header.version !== BUNDLE_VERSION) {
+    throw new RangeError(`bundle version must be ${BUNDLE_VERSION}, got ${header.version}`);
   }
   assertUint64("generation", header.generation);
   assertUint64("built_at", header.builtAt);
@@ -772,8 +762,10 @@ function emitHeader(buffer: Uint8Array, view: DataView, plan: Plan): void {
   view.setUint16(HEADER_OFFSET.VERSION, plan.header.version, true);
   view.setUint16(HEADER_OFFSET.FLAGS, 0, true);
   view.setBigUint64(HEADER_OFFSET.GENERATION, plan.header.generation, true);
-  for (let index = 0; index < SHARD_PREFIX_BYTES; index += 1) {
-    view.setUint8(HEADER_OFFSET.SHARD + index, plan.header.shard.charCodeAt(index));
+  // Reserved, and the reader refuses them non-zero, so write them explicitly
+  // rather than relying on a freshly zeroed buffer.
+  for (let index = 0; index < HEADER_RESERVED_BYTES; index += 1) {
+    view.setUint8(HEADER_OFFSET.RESERVED + index, 0);
   }
   view.setBigUint64(HEADER_OFFSET.BUILT_AT, plan.header.builtAt, true);
   view.setUint32(HEADER_OFFSET.SECTIONS, plan.sections.length, true);
@@ -896,11 +888,11 @@ function emitArena(buffer: Uint8Array, plan: Plan): void {
  * @throws {BundleCapacityError} when a connection carries more sealed fields
  *   than `CONN_MAX_FIELDS`, when the connection count exceeds what the index can
  *   address, or when the bundle would exceed `BUNDLE_MAX_BYTES`.
- * @throws {RangeError} on a malformed input: a shard prefix that is not four
- *   lowercase letters, a connection naming a group that is not in `groups`, an
- *   envelope with the wrong algorithm, or a filter index out of range.
- * @throws {BundleFormatError} propagated from `parseConnectionId`, when a
- *   connection id is not `<shard>_<uuid>`.
+ * @throws {RangeError} on a malformed input: a connection naming a group that is
+ *   not in `groups`, an envelope with the wrong algorithm, or a filter index out
+ *   of range.
+ * @throws {BundleFormatError} propagated from `parseUuid`, when a connection id
+ *   is not a canonical lowercase UUID.
  */
 export function writeBundle(input: BundleInput): Uint8Array {
   return emitBundle(planBundle(input));

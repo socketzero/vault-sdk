@@ -17,6 +17,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { generateApiKey } from "./api-key.js";
+import { parseUuid } from "./bundle/layout.js";
 import { readBundle } from "./bundle/reader.js";
 import { writeBundleWithChecksum } from "./bundle/writer.js";
 import { revealDump } from "./cli/reveal.js";
@@ -24,14 +25,7 @@ import { utf8Decode, utf8Encode } from "./encoding.js";
 import { fieldAssociatedData, open, seal } from "./envelope.js";
 import { buildBucket, findBucketEntry, generateGroup, rotateGroup, unwrap } from "./group.js";
 import { bundleFromJSON, inspectBundle, verifyBundle } from "./inspect.js";
-import {
-  connectionId,
-  makeConnection,
-  makeGroup,
-  makeUuid,
-  SHARD,
-  TENANT,
-} from "./lifecycle.fixture.js";
+import { connectionId, makeConnection, makeGroup, makeUuid, TENANT } from "./lifecycle.fixture.js";
 import {
   type ApiKeyBytes,
   type BundleInput,
@@ -91,7 +85,7 @@ async function shardOpens(
   const plaintext = await open(
     record.fieldBytes(descriptor),
     privateKey,
-    fieldAssociatedData(id, fieldName),
+    fieldAssociatedData(parseUuid(id), fieldName),
   );
   view.writeBack(descriptor, plaintext);
   return utf8Decode(plaintext);
@@ -128,21 +122,21 @@ describe("the control plane authoring a connection", () => {
     const envelope = await seal(
       utf8Encode(PASSWORD),
       group.pair.publicKey,
-      fieldAssociatedData(STRIPE, "password"),
+      fieldAssociatedData(parseUuid(STRIPE), "password"),
     );
 
     expect(envelope.startsWith("x25519-hkdf-aesgcm:")).toBe(true);
     // Nothing in this scope can undo that. Opening needs the private half, and
     // the private half was never handed to the party that did the sealing.
     await expect(
-      open(envelope, group.pair.privateKey, fieldAssociatedData(STRIPE, "password")),
+      open(envelope, group.pair.privateKey, fieldAssociatedData(parseUuid(STRIPE), "password")),
     ).resolves.toEqual(utf8Encode(PASSWORD));
   });
 
   it("publishes a bundle that verifies structurally, not just by checksum", async () => {
     const group = await makeGroup({ groupId: GROUP, keys: ["live"] });
     const input: BundleInput = {
-      header: { version: 1, generation: 1n, shard: SHARD, builtAt: 1_726_000_000_000n },
+      header: { version: 1, generation: 1n, builtAt: 1_726_000_000_000n },
       groups: [group.keyGroup],
       connections: [
         await makeConnection({
@@ -168,7 +162,7 @@ describe("the shard serving a request", () => {
   async function published(keys: readonly ("live" | "test")[] = ["live"]) {
     const group = await makeGroup({ groupId: GROUP, keys });
     const input: BundleInput = {
-      header: { version: 1, generation: 1n, shard: SHARD, builtAt: 1_726_000_000_000n },
+      header: { version: 1, generation: 1n, builtAt: 1_726_000_000_000n },
       groups: [group.keyGroup],
       connections: [
         await makeConnection({
@@ -224,7 +218,7 @@ describe("the shard serving a request", () => {
     const first = await open(
       record.fieldBytes(descriptor),
       privateKey,
-      fieldAssociatedData(STRIPE, "password"),
+      fieldAssociatedData(parseUuid(STRIPE), "password"),
     );
     const cached = view.writeBack(descriptor, first);
 
@@ -262,12 +256,6 @@ describe("the shard serving a request", () => {
     await expect(shardOpens(bytes, STRIPE, "password", a.bytes)).resolves.toBe(PASSWORD);
     await expect(shardOpens(bytes, STRIPE, "password", b.bytes)).resolves.toBe(PASSWORD);
   });
-
-  it("does not resolve a connection that belongs to another shard", async () => {
-    const { bytes } = await published();
-    const elsewhere = connectionId(0x00000001, "usea");
-    expect(readBundle(bytes).lookup(elsewhere)).toBeUndefined();
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -284,10 +272,10 @@ describe("rotating a key group after an API key is revoked", () => {
     const envelope = await seal(
       utf8Encode(PASSWORD),
       group.pair.publicKey,
-      fieldAssociatedData(STRIPE, "password"),
+      fieldAssociatedData(parseUuid(STRIPE), "password"),
     );
     const fields: SealedField[] = [
-      { identity: { connectionId: STRIPE, fieldName: "password" }, envelope },
+      { identity: { connectionUuid: parseUuid(STRIPE), fieldName: "password" }, envelope },
     ];
 
     const rotation = await rotateGroup(
@@ -301,7 +289,7 @@ describe("rotating a key group after an API key is revoked", () => {
     if (resealed === undefined) throw new Error("rotation returned no fields");
 
     const republished = await writeBundleWithChecksum({
-      header: { version: 1, generation: 2n, shard: SHARD, builtAt: 1_726_000_100_000n },
+      header: { version: 1, generation: 2n, builtAt: 1_726_000_100_000n },
       groups: [
         { groupId: GROUP, publicKey: rotation.publicKey, generation: 1, bucket: rotation.bucket },
       ],
@@ -329,7 +317,11 @@ describe("rotating a key group after an API key is revoked", () => {
       VaultDecryptionError,
     );
     await expect(
-      open(resealed.envelope, group.pair.privateKey, fieldAssociatedData(STRIPE, "password")),
+      open(
+        resealed.envelope,
+        group.pair.privateKey,
+        fieldAssociatedData(parseUuid(STRIPE), "password"),
+      ),
     ).rejects.toThrow(VaultDecryptionError);
   });
 
@@ -352,7 +344,7 @@ describe("rotating a key group after an API key is revoked", () => {
     if (key === undefined) throw new Error("no key");
 
     const old = await writeBundleWithChecksum({
-      header: { version: 1, generation: 1n, shard: SHARD, builtAt: 1n },
+      header: { version: 1, generation: 1n, builtAt: 1n },
       groups: [group.keyGroup],
       connections: [
         await makeConnection({
@@ -377,7 +369,7 @@ describe("the debugging tools, against the artifact the shard actually reads", (
   async function published() {
     const group = await makeGroup({ groupId: GROUP, keys: ["test"] });
     const bytes = await writeBundleWithChecksum({
-      header: { version: 1, generation: 9n, shard: SHARD, builtAt: 1_726_000_000_000n },
+      header: { version: 1, generation: 9n, builtAt: 1_726_000_000_000n },
       groups: [group.keyGroup],
       connections: [
         await makeConnection({

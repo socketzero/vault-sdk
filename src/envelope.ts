@@ -51,6 +51,8 @@ export const ENVELOPE_OVERHEAD_BYTES = 60;
 export const HKDF_INFO_ENVELOPE = "socket0/v1";
 /** The X25519 base point, used to recover a public half from a private one. */
 export const X25519_BASE_POINT_BYTES = 32;
+/** A connection id is a UUID: sixteen raw bytes. */
+export const CONNECTION_UUID_BYTES = 16;
 /** Every associated-data component carries a big-endian `u32` length prefix. */
 export const AAD_LENGTH_PREFIX_BYTES = 4;
 
@@ -250,8 +252,8 @@ export async function derivePublicKey(privateKey: PrivateKey): Promise<PublicKey
  * the exact byte string the caller passed, so a mismatch fails rather than
  * being silently repaired.
  */
-function associatedData(...components: readonly string[]): AssociatedData {
-  const encoded = components.map(utf8Encode);
+function associatedData(...components: readonly (string | Uint8Array)[]): AssociatedData {
+  const encoded = components.map((c) => (typeof c === "string" ? utf8Encode(c) : c));
   let total = 0;
   for (const component of encoded) {
     total += AAD_LENGTH_PREFIX_BYTES + component.length;
@@ -269,13 +271,25 @@ function associatedData(...components: readonly string[]): AssociatedData {
 }
 
 /**
- * Build the associated data for a credential field: `AAD(connection_id, field_name)`.
+ * Build the associated data for a credential field: `AAD(connection_uuid, field_name)`.
  *
  * An envelope copied from one connection's row to another's, or from `password`
  * into `api_key`, fails to open.
+ *
+ * **The raw sixteen UUID bytes, never a rendered id.** Until v2 this bound the
+ * display string, which meant the shard prefix in front of the UUID was part of
+ * every envelope's associated data — so four bytes of bundle header decided
+ * whether any field could be opened. Binding the bytes binds the identity
+ * itself, and a `Uint8Array` parameter makes handing over a display string a
+ * compile error rather than a silent re-binding.
  */
-export function fieldAssociatedData(connectionId: string, fieldName: string): AssociatedData {
-  return associatedData(connectionId, fieldName);
+export function fieldAssociatedData(connectionUuid: Uint8Array, fieldName: string): AssociatedData {
+  if (connectionUuid.byteLength !== CONNECTION_UUID_BYTES) {
+    throw new VaultError(
+      `a connection id is ${CONNECTION_UUID_BYTES} raw UUID bytes, received ${connectionUuid.byteLength}`,
+    );
+  }
+  return associatedData(connectionUuid, fieldName);
 }
 
 /** Build the associated data for a bucket entry: `AAD(group_id, key_id)`. */

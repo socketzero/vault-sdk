@@ -437,7 +437,6 @@ describe("stat", () => {
     expect(await runCli(["stat", "b.bin"], h.io)).toBe(0);
 
     const text = out(h);
-    expect(text).toContain("shard           eumc");
     expect(text).toContain("generation      47");
     expect(text).toContain("connections     3");
     expect(text).toContain("groups          2 (3 bucket entries)");

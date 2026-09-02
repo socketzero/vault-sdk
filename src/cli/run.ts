@@ -164,7 +164,6 @@ async function statCommand(argv: readonly string[], io: CliIO): Promise<number> 
   const dump = inspectBundle(view, { limit: 0 });
   const s = dump.stats;
 
-  io.out(`shard           ${dump.header.shard}`);
   io.out(`generation      ${dump.header.generation}`);
   io.out(`built at        ${dump.header.builtAt}`);
   io.out(`total bytes     ${s.totalBytes}`);

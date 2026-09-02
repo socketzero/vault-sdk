@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-
 import { deriveWrapKey } from "./api-key.js";
+import { parseUuid } from "./bundle/layout.js";
 import { fieldAssociatedData, open, seal } from "./envelope.js";
 import {
   buildBucket,
@@ -107,11 +107,11 @@ function sealFields(
 ): Promise<SealedField[]> {
   return Promise.all(
     Array.from(values, async ([fieldName, value]) => ({
-      identity: { connectionId: "conn_01JC", fieldName },
+      identity: { connectionUuid: parseUuid("01c00000-0000-4000-8000-000000000001"), fieldName },
       envelope: await seal(
         new TextEncoder().encode(value),
         publicKey,
-        fieldAssociatedData("conn_01JC", fieldName),
+        fieldAssociatedData(parseUuid("01c00000-0000-4000-8000-000000000001"), fieldName),
       ),
     })),
   );
@@ -122,7 +122,7 @@ async function openField(field: SealedField, privateKey: PrivateKey): Promise<st
     await open(
       field.envelope,
       privateKey,
-      fieldAssociatedData(field.identity.connectionId, field.identity.fieldName),
+      fieldAssociatedData(field.identity.connectionUuid, field.identity.fieldName),
     ),
   );
 }
@@ -552,7 +552,7 @@ describe("rotateGroup", () => {
       open(
         resealed.envelope,
         rotation.privateKey,
-        fieldAssociatedData(resealed.identity.connectionId, "api_key"),
+        fieldAssociatedData(resealed.identity.connectionUuid, "api_key"),
       ),
     ).rejects.toThrow(VaultDecryptionError);
   });

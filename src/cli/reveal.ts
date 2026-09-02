@@ -13,6 +13,7 @@
  * reads a buffer.
  */
 
+import { parseUuid } from "../bundle/layout.js";
 import { base64Decode, hexDecode, utf8Decode } from "../encoding.js";
 import { fieldAssociatedData, open } from "../envelope.js";
 import { findBucketEntry, unwrap } from "../group.js";
@@ -84,7 +85,7 @@ export async function revealDump(
         const plaintext = await open(
           field.envelope,
           privateKey,
-          fieldAssociatedData(connection.connectionId, name),
+          fieldAssociatedData(parseUuid(connection.connectionId), name),
         );
         revealed.set(revealKey(connection.connectionId, name), utf8Decode(plaintext));
       } catch (cause) {
