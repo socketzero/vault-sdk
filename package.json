@@ -33,7 +33,8 @@
     "lint": "biome check .",
     "format": "biome format --write .",
     "check": "npm run typecheck && npm run lint && npm run test:cov",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "bench": "npm run build && node bench/bundle-bench.mjs"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.11",

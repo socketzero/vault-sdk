@@ -1,0 +1,67 @@
+name: Benchmark
+
+# Triggers carry no attacker-controlled text, and no run: step interpolates
+# event text — the only value passed through is a numeric PR id, via env.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Monday 06:00 UTC, so drift shows up even in a quiet week.
+    - cron: "0 6 * * 1"
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  bench:
+    name: Lookup at 10 / 20 / 30 MB resident
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      # Run this first: if a fully clustered index no longer trips the probe
+      # gates, the benchmark below is measuring nothing and its green is a lie.
+      - name: Prove the gate can fail
+        run: node bench/bundle-bench.mjs --self-test | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Appends its own report to the step summary and writes bench-report.md.
+      - name: Benchmark
+        run: node bench/bundle-bench.mjs
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: |
+            bench-results.json
+            bench-report.md
+          retention-days: 90
+
+      # Sticky comment: edit the previous one rather than pile up a comment per push.
+      - name: Comment on the pull request
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ ! -f bench-report.md ]; then
+            printf '## Vault bundle lookup benchmark\n\n**The benchmark did not produce a report** — it failed before reporting.\n' > bench-report.md
+          fi
+          gh pr comment "$PR_NUMBER" --body-file bench-report.md --edit-last \
+            || gh pr comment "$PR_NUMBER" --body-file bench-report.md

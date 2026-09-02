@@ -6,3 +6,5 @@ coverage/
 .env
 .env.*
 *.log
+bench-results.json
+bench-report.md
