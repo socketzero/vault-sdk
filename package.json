@@ -1,6 +1,6 @@
 {
   "name": "@socket0/vault-sdk",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "The one implementation of the Socket0 vault: envelopes, key groups, buckets, the API key format and the binary bundle.",
   "license": "MIT",
   "type": "module",
