@@ -1,6 +1,14 @@
 # @socket0/vault-sdk
 
 [![npm](https://img.shields.io/npm/v/%40socket0%2Fvault-sdk?color=4A56C0&label=npm)](https://www.npmjs.com/package/@socket0/vault-sdk)
+[![license](https://img.shields.io/npm/l/%40socket0%2Fvault-sdk?color=4A56C0)](./LICENSE)
+[![node](https://img.shields.io/node/v/%40socket0%2Fvault-sdk?color=4A56C0)](#toolchain)
+[![types](https://img.shields.io/npm/types/%40socket0%2Fvault-sdk?color=4A56C0)](#the-surface)
+[![dependencies](https://img.shields.io/badge/dependencies-0-4A56C0)](#no-dependencies)
+[![coverage](https://img.shields.io/badge/coverage-100%25-4A56C0)](#toolchain)
+[![module](https://img.shields.io/badge/module-ESM_only-4A56C0)](#toolchain)
+[![crypto](https://img.shields.io/badge/crypto-Web_Crypto_only-4A56C0)](#invariants)
+[![unpacked size](https://img.shields.io/npm/unpacked-size/%40socket0%2Fvault-sdk?color=4A56C0&label=unpacked)](https://www.npmjs.com/package/@socket0/vault-sdk?activeTab=code)
 [![playground](https://img.shields.io/badge/playground-vault.socket0.com-4A56C0)](https://vault.socket0.com)
 
 The one implementation of the Socket0 vault: the envelope, the key group and its bucket,
@@ -181,6 +189,21 @@ from, not the one that is active when the async unwrap finishes.
 
 **Web Crypto only.** `globalThis.crypto.subtle`. No `node:crypto`, no wasm, no third-party
 crypto library.
+
+## No dependencies
+
+`dependencies`, `peerDependencies` and `optionalDependencies` are all empty, and that is a
+security property before it is a packaging one. This package handles private key material,
+so every transitive package would be a party that can read it — a supply-chain compromise
+anywhere in the tree is a credential exfiltration, not a broken build. There is nothing in
+the tree.
+
+The crypto is Web Crypto (`globalThis.crypto.subtle`): no `node:crypto`, no wasm, no
+third-party crypto library. That is also why the same build runs at the edge, in Node and
+in a browser tab — the playground is the same `dist/` this package publishes.
+
+`sideEffects` is `false` and the package is ESM only, so a bundler drops what a caller does
+not import.
 
 ## Toolchain
 
