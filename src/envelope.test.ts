@@ -519,3 +519,47 @@ describe("formatEnvelope", () => {
     expect(() => formatEnvelope(new Uint8Array(0))).toThrow(/is 0 bytes, below the 60-byte/);
   });
 });
+
+describe("open contains the whole derive path in the failure taxonomy", () => {
+  /**
+   * An attacker controls the ephemeral half carried in an envelope. A low-order
+   * or otherwise invalid X25519 point makes the ephemeral import or the shared-
+   * secret derivation throw a raw `OperationError` DOMException — which, before
+   * the fix, escaped `open` as an unhandled rejection rather than the uniform
+   * `VaultDecryptionError`. On the relay's refusal path that is a distinguishable
+   * outcome: a different status and a different timing envelope, i.e. an oracle.
+   */
+  const LOW_ORDER_POINTS: readonly Uint8Array[] = [
+    new Uint8Array(32), // all zero — the identity/small-order point
+    Uint8Array.from({ length: 32 }, (_v, i) => (i === 0 ? 1 : 0)), // order-1 point
+    Uint8Array.from({ length: 32 }, (_v, i) => (i === 31 ? 0x80 : 0)), // high-bit-only
+  ];
+
+  it.each(LOW_ORDER_POINTS.map((point, i) => [i, point] as const))(
+    "maps a bad ephemeral point (#%i) to VaultDecryptionError, not a DOMException",
+    async (_i, point) => {
+      const pair = await generateX25519KeyPair();
+      const aad = fieldAssociatedData("conn", "field");
+      const genuine = await seal(new Uint8Array([1, 2, 3]), pair.publicKey, aad);
+
+      // Splice the attacker's point over the genuine ephemeral half.
+      const payload = base64Decode(genuine.slice(SEAL_ALGORITHM.length + 1));
+      payload.set(point, 0);
+      const forged = `${SEAL_ALGORITHM}:${base64Encode(payload)}`;
+
+      await expect(open(forged, pair.privateKey, aad)).rejects.toBeInstanceOf(VaultDecryptionError);
+    },
+  );
+
+  it("still reports a malformed recipient private half as a caller bug", async () => {
+    const pair = await generateX25519KeyPair();
+    const aad = fieldAssociatedData("conn", "field");
+    const genuine = await seal(new Uint8Array([1, 2, 3]), pair.publicKey, aad);
+
+    // A wrong-sized private half is the caller's mistake, not an authentication
+    // failure, and must stay loud rather than be masked as a decryption error.
+    const shortKey = unchecked<PrivateKey>(new Uint8Array(31));
+    await expect(open(genuine, shortKey, aad)).rejects.toBeInstanceOf(VaultError);
+    await expect(open(genuine, shortKey, aad)).rejects.not.toBeInstanceOf(VaultDecryptionError);
+  });
+});

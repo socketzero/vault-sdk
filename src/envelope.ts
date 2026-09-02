@@ -357,14 +357,22 @@ export async function open(
     recipientPublicKey === undefined
       ? await publicKeyOf(recipientPrivate)
       : assertX25519KeyLength(recipientPublicKey, "an X25519 public key");
-  const ephemeralPublic = await importPublicKey(parts.ephemeralPublicKey);
-  const contentKey = await deriveContentKey(
-    recipientPrivate,
-    ephemeralPublic,
-    parts.ephemeralPublicKey,
-    recipientPublic,
-  );
   try {
+    // The ephemeral half comes from the envelope — i.e. from an attacker, on the
+    // relay's refusal path. A low-order or otherwise invalid point makes the
+    // import or the X25519 derivation throw a raw `OperationError`, so both live
+    // inside this catch: every authentication-shaped failure leaves as one
+    // `VaultDecryptionError`, or an escaping DOMException becomes the timing- and
+    // status-distinguishable outcome the relay must never expose. The recipient's
+    // own key is imported above and stays outside — a malformed private half is a
+    // caller bug and must surface loudly as a `VaultError`, not be masked here.
+    const ephemeralPublic = await importPublicKey(parts.ephemeralPublicKey);
+    const contentKey = await deriveContentKey(
+      recipientPrivate,
+      ephemeralPublic,
+      parts.ephemeralPublicKey,
+      recipientPublic,
+    );
     return new Uint8Array(
       await globalThis.crypto.subtle.decrypt(
         {
@@ -378,9 +386,9 @@ export async function open(
       ),
     );
   } catch {
-    // One error for wrong key, wrong group, wrong AAD and flipped bits. The
-    // cause is deliberately dropped: a caller able to tell them apart could
-    // build the enumeration oracle the relay must not offer.
+    // One error for wrong key, wrong group, wrong AAD, a bad ephemeral point and
+    // flipped bits. The cause is deliberately dropped: a caller able to tell them
+    // apart could build the enumeration oracle the relay must not offer.
     throw new VaultDecryptionError();
   }
 }
