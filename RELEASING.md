@@ -40,9 +40,14 @@ git commit --allow-empty -m "chore: release 1.0.0" -m "Release-As: 1.0.0"
 
 ## Publishing to npm
 
-The package ships as `@socket0/vault-sdk`. Four things must be true before a
-release can publish, and none of them are decisions this repo should make on
-your behalf.
+Publishing uses **npm trusted publishing (OIDC)** — no long-lived `NPM_TOKEN`
+lives in this repo. Each run mints a short-lived credential from GitHub's OIDC
+provider, and npm attaches [provenance](https://docs.npmjs.com/generating-provenance-statements)
+automatically. A leaked repo secret cannot publish this package, because there
+is no repo secret.
+
+`publish.yml` is already written for it. What remains are decisions and a
+one-time bootstrap.
 
 ### 1. Decide the package is publishable
 
@@ -52,56 +57,91 @@ your behalf.
 { "private": true, "license": "UNLICENSED" }
 ```
 
-`private: true` is npm's hard block on publishing. Removing it means this code
-is going to a registry, so settle the licence in the same change — `UNLICENSED`
-is right for a package that stays internal, and wrong for one on the public
-registry. Pick a real SPDX identifier (`MIT`, `Apache-2.0`, …) or keep it
-`UNLICENSED` and publish privately (paid npm scope).
+`private: true` is npm's hard block on publishing, and the workflow refuses to
+publish while it is set. Removing it means this code goes to a registry, so
+settle the licence in the same change — `UNLICENSED` is right for a package that
+stays internal and wrong for one on the public registry. Pick a real SPDX
+identifier (`MIT`, `Apache-2.0`, …), or keep `UNLICENSED` and publish privately
+to a paid npm org.
 
 ### 2. Own the `@socket0` scope
 
 A scoped name can only be published by someone with rights to the scope:
 
 ```bash
-npm org ls socket0            # who is in the org
+npm org ls socket0
 npm access ls-packages @socket0
 ```
 
-If the scope is not yours, either claim it or rename the package. **Do not
-publish under a scope you do not control** — a name someone else owns is a
-supply-chain problem waiting to happen.
+If the scope is not yours, claim it or rename the package. **Do not publish
+under a scope you do not control.**
 
-### 3. Choose public or private on the registry
+### 3. Choose public or restricted
 
-Scoped packages default to **restricted**. Add to `package.json`:
+Scoped packages default to **restricted**. For a public package add:
 
 ```json
 "publishConfig": { "access": "public" }
 ```
 
-…for a public package. Omit it (and keep a paid npm org) for a private one.
+### 4. Bootstrap the first version by hand
 
-### 4. Add the `NPM_TOKEN` secret
+This is the one genuinely awkward step, and it is a limitation of npm rather
+than of this setup: **a trusted publisher can only be configured on a package
+that already exists.** npm requires the name to be taken before it will bind a
+publisher to it, which stops someone pre-claiming a trusted publisher on a name
+they do not own. So the first release cannot come from OIDC.
 
-Create an **automation** token on npm (it bypasses 2FA prompts, which is what
-CI needs), then:
+Publish `0.1.0` once, from your own machine, with your own npm login:
 
 ```bash
-gh secret set NPM_TOKEN --repo socketzero/vault-sdk   # paste at the prompt
+npm login                 # your account, 2FA as normal
+npm run check             # typecheck, lint, tests, 100% coverage
+npm pack --dry-run        # confirm exactly what ships
+npm publish               # prepack rebuilds dist/ first
 ```
 
-Grant it write access to the `@socket0` scope only — not a full-account token.
+### 5. Bind the trusted publisher
 
-Once all four hold, merging a release PR publishes automatically with
-[provenance](https://docs.npmjs.com/generating-provenance-statements) attached,
-after `npm run check` passes.
-
-### Publishing by hand
+Then hand publishing to CI and never use a token again — either in the npm web
+UI (Package → Settings → Trusted Publisher) or from the CLI:
 
 ```bash
-npm run check          # typecheck, lint, tests, 100% coverage gate
-npm pack --dry-run     # inspect exactly what ships
-npm publish            # prepack rebuilds dist/ first
+npm trust github @socket0/vault-sdk \
+  --repo socketzero/vault-sdk \
+  --file publish.yml \
+  --allow-publish
+
+npm trust list @socket0/vault-sdk    # confirm it bound
+```
+
+The `--file` value is the **workflow filename only**, not a path, and it must
+match `.github/workflows/publish.yml`. Renaming that file breaks publishing
+until the trusted publisher is updated — `npm trust revoke @socket0/vault-sdk
+--id <id>` and re-add.
+
+If you add `environment:` to the publish job, the same environment name must be
+set on the trusted publisher, or npm rejects the OIDC token.
+
+### 6. Remove `private` and let CI take over
+
+With the publisher bound, drop `"private": true`, merge, and every subsequent
+release publishes itself when its release PR is merged.
+
+### Requirements the workflow already handles
+
+- **npm CLI ≥ 11.5.1** — Node 22 ships an older npm, so the workflow installs a
+  new enough CLI before publishing.
+- **Node ≥ 22.14.0** — satisfied by `node-version: "22"`.
+- **`id-token: write`** — granted at the workflow level; without it the OIDC
+  token cannot be minted.
+
+### Publishing by hand later
+
+```bash
+npm run check
+npm pack --dry-run
+npm publish
 ```
 
 `npm pack --dry-run` is worth the ten seconds: `files` in `package.json` ships
