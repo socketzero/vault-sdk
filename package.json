@@ -16,7 +16,10 @@
   },
   "files": [
     "dist",
-    "bin"
+    "bin",
+    "src",
+    "!src/**/*.test.ts",
+    "!src/**/*.fixture.ts"
   ],
   "engines": {
     "node": ">=22"
