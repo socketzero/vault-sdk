@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/socketzero/vault-sdk/compare/v0.3.0...v0.3.1) (2026-09-02)
+
+
+### Performance
+
+* strip comments from the published JS, keep them in the declarations ([98fdefb](https://github.com/socketzero/vault-sdk/commit/98fdefbf18d00053a6d7b44a34fa832fec639925))
+
 ## [0.3.0](https://github.com/socketzero/vault-sdk/compare/v0.2.2...v0.3.0) (2026-09-02)
 
 
