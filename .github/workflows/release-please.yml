@@ -6,16 +6,79 @@ on:
     branches: [main]
   workflow_dispatch:
 
-permissions:
-  contents: write
-  pull-requests: write
+permissions: {}
 
 jobs:
   release:
     name: Maintain the release PR and tag
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      released: ${{ steps.release.outputs.releases_created }}
+      tag: ${{ steps.release.outputs['.--tag_name'] }}
     steps:
       - uses: googleapis/release-please-action@v4
+        id: release
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+  # Publishing lives here rather than in its own `on: release` workflow because
+  # release-please cuts the release with GITHUB_TOKEN, and GitHub deliberately
+  # does not let events from that token start another workflow run. An
+  # `on: release: [published]` workflow would therefore never fire — it would sit
+  # green and idle forever. Chaining off this job's output is what actually runs.
+  publish:
+    name: Publish to npm
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write # OIDC: the only credential publishing uses
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Trusted publishing needs Node >= 22.14.0.
+          node-version: "22"
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      # Node 22 ships an npm older than the 11.5.1 that understands OIDC
+      # trusted publishing, so pin a new enough CLI explicitly.
+      - name: Use an npm that supports trusted publishing
+        run: |
+          npm install -g npm@^11.5.1
+          npm --version
+
+      # Deliberately inert until publishing is opted into: the package is marked
+      # private, and npm cannot bind a trusted publisher to a name that does not
+      # exist yet. Skipping loudly beats failing every release, and beats
+      # publishing something nobody decided to publish. See RELEASING.md.
+      - name: Check publish prerequisites
+        id: gate
+        run: |
+          if node -e "process.exit(require('./package.json').private === true ? 1 : 0)"; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::package.json still has \"private\": true — skipping publish. See RELEASING.md."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install
+        if: steps.gate.outputs.ok == 'true'
+        run: npm ci
+
+      - name: Verify before publishing
+        if: steps.gate.outputs.ok == 'true'
+        run: npm run check
+
+      # No NODE_AUTH_TOKEN. OIDC supplies the credential, and npm attaches
+      # provenance automatically for a trusted-publisher release.
+      - name: Publish
+        if: steps.gate.outputs.ok == 'true'
+        run: npm publish

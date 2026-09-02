@@ -27,8 +27,8 @@ npm is wired but **switched off** until someone deliberately turns it on — see
 
 3. **Merge the release PR.** That tags `vX.Y.Z` and publishes a GitHub release.
 
-4. **The publish workflow fires** on that release — and currently skips, loudly,
-   until the prerequisites below are met.
+4. **The publish job runs** in the same workflow, right after the release is
+   cut — and currently skips, loudly, until the prerequisites below are met.
 
 ### Cutting 1.0.0
 
@@ -46,7 +46,7 @@ provider, and npm attaches [provenance](https://docs.npmjs.com/generating-proven
 automatically. A leaked repo secret cannot publish this package, because there
 is no repo secret.
 
-`publish.yml` is already written for it. What remains are decisions and a
+The publish job in `release-please.yml` is already written for it. What remains are decisions and a
 one-time bootstrap.
 
 ### 1. Decide the package is publishable
@@ -109,16 +109,23 @@ UI (Package → Settings → Trusted Publisher) or from the CLI:
 ```bash
 npm trust github @socket0/vault-sdk \
   --repo socketzero/vault-sdk \
-  --file publish.yml \
+  --file release-please.yml \
   --allow-publish
 
 npm trust list @socket0/vault-sdk    # confirm it bound
 ```
 
 The `--file` value is the **workflow filename only**, not a path, and it must
-match `.github/workflows/publish.yml`. Renaming that file breaks publishing
-until the trusted publisher is updated — `npm trust revoke @socket0/vault-sdk
---id <id>` and re-add.
+match `.github/workflows/release-please.yml` — publishing is a job *inside* that
+workflow, not a separate one. Renaming the file breaks publishing until the
+trusted publisher is updated: `npm trust revoke @socket0/vault-sdk --id <id>`,
+then re-add.
+
+Publishing lives there because release-please cuts the release using
+`GITHUB_TOKEN`, and GitHub does not let events raised by that token start
+another workflow run. A separate `on: release` workflow would never fire at
+all — it would simply sit idle. Chaining off release-please's own
+`releases_created` output is what actually runs.
 
 If you add `environment:` to the publish job, the same environment name must be
 set on the trusted publisher, or npm rejects the OIDC token.
