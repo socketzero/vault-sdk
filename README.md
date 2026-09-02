@@ -15,13 +15,27 @@ and seals a credential before it is ever transmitted. A disagreement between any
 is a credential one party wrote and another cannot read — discovered weeks later, on
 somebody's first relayed call, with the plaintext long gone.
 
-**[vault.socket0.com](https://vault.socket0.com)** runs this package in the browser: build a
-bundle from a tree form, mint real X25519 groups and API keys, and round-trip to the binary
-in both directions. It is the fastest way to see the format before you depend on it.
-
 - **npm** — <https://www.npmjs.com/package/@socket0/vault-sdk>
 - **Source** — <https://github.com/socketzero/vault-sdk>
 - **Playground** — <https://vault.socket0.com> ([source](https://github.com/socketzero/vault-playground))
+
+## Try it before you depend on it
+
+**[vault.socket0.com](https://vault.socket0.com)** runs this package in the browser — not a
+mock of it. Web Crypto mints real X25519 groups and real API keys in the tab, `writeBundle`
+emits the bytes on the right, and `readBundle` reads them back. Nothing is uploaded.
+
+[![The playground: a vault on the left, its binary bundle on the right](https://vault.socket0.com/shots/playground.png)](https://vault.socket0.com)
+
+Build a vault on the left and the bundle appears on the right with its size, its checksum
+and its decoded section table; paste a bundle instead and it projects back onto the form.
+Present the API key and it will unwrap the group and open the fields, which is the whole
+asymmetry this package exists to enforce — sealing needs a public half, opening needs a key
+somebody holds.
+
+Its **How it works** panel is the short version of the invariants below:
+
+[![The how-it-works panel, showing the K2 to K1 to plaintext key ladder](https://vault.socket0.com/shots/playground-help.png)](https://vault.socket0.com)
 
 ## The catalog is the specification
 
