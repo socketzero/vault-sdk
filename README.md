@@ -203,7 +203,23 @@ third-party crypto library. That is also why the same build runs at the edge, in
 in a browser tab — the playground is the same `dist/` this package publishes.
 
 `sideEffects` is `false` and the package is ESM only, so a bundler drops what a caller does
-not import.
+not import. There is no `postinstall`, `install` or `prepare` script: installing this package
+extracts files and runs no code.
+
+The published JS is compiled with comments stripped and the declarations are compiled
+separately with comments kept, because `removeComments` is not selective — one setting for
+both passes deletes every hover doc a consumer sees, silently. So `dist/*.d.ts` stays the
+documentation and `dist/*.js` stays the code. CI asserts both halves; a tarball whose
+declarations lost their JSDoc fails the build.
+
+| | packed | unpacked | imported graph | browser bundle |
+|---|---:|---:|---:|---:|
+| what it is | download | on disk | what `import` reads | minified + gzip |
+| size | ~53 kB | ~200 kB | 9 modules | ~15 kB |
+
+The CLI's `dist/cli/*.js` is in that on-disk figure and is never in the import graph — the
+`exports` map publishes `"."` and nothing else, so `bin/s0bundle.js` is the only thing that
+reaches it.
 
 ## Toolchain
 

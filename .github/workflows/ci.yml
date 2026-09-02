@@ -81,6 +81,29 @@ jobs:
           console.log(`tarball ok — ${files.length} files, no source, no maps`);
           JS
 
+      # The build strips comments from the JS and keeps them in the
+      # declarations, because `removeComments` is not selective: set it once for
+      # both passes and every hover doc a consumer sees disappears, silently and
+      # with all tests still green. Assert both halves.
+      - name: Assert the declarations kept their documentation
+        run: |
+          npm pack --silent > /dev/null
+          mkdir -p /tmp/shape && tar xzf socket0-vault-sdk-*.tgz -C /tmp/shape
+          node --input-type=module <<'JS'
+          import { readFileSync } from "node:fs";
+          const dts = readFileSync("/tmp/shape/package/dist/index.d.ts", "utf8");
+          const js = readFileSync("/tmp/shape/package/dist/bundle/reader.js", "utf8");
+          if (!dts.includes("/**")) {
+            console.error("dist/index.d.ts carries no JSDoc — removeComments leaked into the declaration pass");
+            process.exit(1);
+          }
+          if (js.includes("/**")) {
+            console.error("dist/bundle/reader.js still carries JSDoc — the JS pass is not stripping");
+            process.exit(1);
+          }
+          console.log("shape ok — declarations documented, JS stripped");
+          JS
+
       # The package is ESM with an exports map; prove a consumer can actually
       # import it, rather than only that it compiled.
       - name: Assert the built package imports and works

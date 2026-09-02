@@ -1,0 +1,18 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": "src",
+    "outDir": "dist",
+
+    // Declarations only, comments intact: this is the documentation a consumer
+    // actually reads, since it is what an editor shows on hover and the repo
+    // is not public.
+    "emitDeclarationOnly": true,
+    "declaration": true,
+    "declarationMap": false,
+    "removeComments": false
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/*.test.ts", "src/**/*.fixture.ts"]
+}

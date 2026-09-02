@@ -3,7 +3,16 @@
   "compilerOptions": {
     "noEmit": false,
     "rootDir": "src",
-    "outDir": "dist"
+    "outDir": "dist",
+
+    // JS only, stripped. `removeComments` is not selective — it takes the
+    // prose out of the declarations too, and the declarations are where an
+    // editor reads its hover documentation. So declarations come from a
+    // second pass (tsconfig.types.json) that keeps every comment.
+    "removeComments": true,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false
   },
   "include": ["src/**/*.ts"],
   "exclude": ["src/**/*.test.ts", "src/**/*.fixture.ts"]
