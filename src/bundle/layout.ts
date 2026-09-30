@@ -111,7 +111,16 @@ export const INDEX_MIN_SLOTS_PER_CONNECTION = 4;
  * every id collide with every other as soon as a second connection arrived.
  */
 export const INDEX_MIN_SLOTS = 8;
-/** A full shard: 262,144 slots, 2 MiB, roughly 51,000 connections. */
+/**
+ * The largest index: 262,144 slots, 2 MiB. At four slots per connection it
+ * admits 262,144 / 4 = 65,536 connections (`indexSlotCount`), but it is not the
+ * binding limit. `BUNDLE_MAX_BYTES` in `writer.ts` is: a bundle of more than
+ * 32,768 connections carries this full index, and every connection costs a
+ * fixed `CONN_RECORD_BYTES` (192) before any `STRS` byte, so a 10 MiB bundle
+ * holds at most (10,485,760 - 144 - 2,097,152) / 192 = 43,689 connections with
+ * an empty arena, and fewer with real values. 144 is the header plus five
+ * section-table entries.
+ */
 export const INDEX_MAX_SLOTS = 262144;
 /** The connection id's UUID part is sixteen bytes; all sixteen are verified on a hit. */
 export const CONNECTION_ID_BYTES = 16;
@@ -133,7 +142,7 @@ export const CONN_OFFSET = {
   TARGET_LENGTH: 24, // uint32
   VISIBLE_OFFSET: 28, // uint32, into STRS
   VISIBLE_LENGTH: 32, // uint32
-  FILTERS_OFFSET: 36, // uint32, into FILT indices
+  FILTERS_OFFSET: 36, // uint32, into STRS: FILTERS_COUNT uint32 indices into FILT
   FILTERS_COUNT: 40, // uint32
   EXPIRES_AT: 44, // uint64, unix millis; 0 means null
   FIELD_COUNT: 52, // uint32
