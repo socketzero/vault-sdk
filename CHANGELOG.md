@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/socketzero/vault-sdk/compare/v0.3.1...v0.3.2) (2026-09-30)
+
+
+### Documentation
+
+* **bundle:** layout comments state the real capacity bound and FILTERS_OFFSET target ([f1e946d](https://github.com/socketzero/vault-sdk/commit/f1e946d907e173acac0ab5197b9c773d43ef4f84))
+
 ## [0.3.1](https://github.com/socketzero/vault-sdk/compare/v0.3.0...v0.3.1) (2026-09-02)
 
 
