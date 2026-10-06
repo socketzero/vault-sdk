@@ -78,7 +78,7 @@ ten and nothing else. They are exported from `src/index.ts` under exactly those 
 | `unwrap(entry, apiKey, tenantId, groupId)` | yes — an API key |
 | `deriveKeyId(apiKey, tenantId)` | yes — an API key |
 | `parseKey(display)` | no |
-| `rotateGroup(oldPriv, fields, apiKeys, tenantId, groupId)` | yes — an API key |
+| `rotateGroup(oldPriv, fields, apiKeys, tenantId, groupId, recoveryPub?)` | yes — an API key |
 | `writeBundle(input)` | no |
 | `readBundle(buffer)` | no |
 
@@ -93,6 +93,16 @@ resealed fields and the rebuilt bucket **together or not at all**, because a par
 leaves fields no surviving key can open and there is no recovery path. It writes nothing;
 persisting the whole result atomically is the caller's job, and the caller is the only party
 that can.
+
+**A group may have a recovery key, K0** (`adr/0035`). Its private half is what a 24-word
+phrase encodes; the phrase code itself lives with the interface that shows it, not here.
+Given K0's public half, `rotateGroup` also returns `recovery`: the new K1 sealed to K0
+(`sealRecovery`), bound by `recoveryAssociatedData(groupId, k1Public)` to this group and this
+generation. `openRecovery(entry, k0Private, groupId, k1Public)` gives K1 back. Sealing needs
+only K0's public half, so a rotation never needs the phrase. The argument is optional: a
+caller rotating a group that has a K0 must pass it and persist `recovery` with the rest of
+the generation, or the phrase stops recovering the group. The library cannot tell. A recovery
+key is not a key in the bucket and never satisfies `buildBucket`'s minimum.
 
 ## Invariants
 

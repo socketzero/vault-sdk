@@ -298,6 +298,22 @@ export function bucketAssociatedData(groupId: string, keyId: string): Associated
 }
 
 /**
+ * Build the associated data for a group's recovery entry:
+ * `AAD(group_id, "recovery", k1_public)` (`adr/0035`).
+ *
+ * Binding K1's public half ties the entry to one generation, so an entry from
+ * before a rotation cannot be presented as the current one; binding the group
+ * id stops it being moved to another group.
+ */
+export function recoveryAssociatedData(groupId: string, k1PublicKey: PublicKey): AssociatedData {
+  return associatedData(
+    groupId,
+    "recovery",
+    assertX25519KeyLength(k1PublicKey, "an X25519 public key"),
+  );
+}
+
+/**
  * Seal a value to a key group's public half.
  *
  * **Needs no secret.** That is what lets the control plane and the credential

@@ -27,6 +27,7 @@ import {
   open,
   seal,
 } from "./envelope.js";
+import { sealRecovery } from "./recovery.js";
 import {
   type ApiKeyBytes,
   asPrivateKey,
@@ -35,6 +36,7 @@ import {
   type GroupRotation,
   type KeyGroup,
   type PrivateKey,
+  type PublicKey,
   type SealedField,
   VaultDecryptionError,
 } from "./types.js";
@@ -320,7 +322,13 @@ export async function buildBucket(
  * @throws {VaultDecryptionError} if any field fails to open under the old private
  *   half. The whole operation fails and returns nothing, because a partial result
  *   is exactly the thing that must never be written.
- * @throws {RangeError} if no API key survives — see `buildBucket`.
+ * @param recoveryPublicKey the group's K0 public half, if it has one. The new
+ *   K1 is then sealed to it and returned as `recovery`, so the phrase keeps
+ *   recovering the group across the rotation (`adr/0035`). Optional by owner
+ *   choice: omitting it for a group that has a K0 is the caller's mistake to
+ *   refuse, because the library cannot see whether the group has one.
+ * @throws {RangeError} if no API key survives — see `buildBucket`. A recovery
+ *   key is not a key in the bucket and does not satisfy this.
  */
 export async function rotateGroup(
   oldPrivateKey: PrivateKey,
@@ -328,6 +336,7 @@ export async function rotateGroup(
   apiKeys: readonly ApiKeyBytes[],
   tenantId: string,
   groupId: string,
+  recoveryPublicKey?: PublicKey,
 ): Promise<GroupRotation> {
   const { publicKey, privateKey } = await generateGroup();
 
@@ -346,5 +355,9 @@ export async function rotateGroup(
     buildBucket(privateKey, apiKeys, tenantId, groupId),
   ]);
 
-  return { publicKey, privateKey, fields: resealed, bucket };
+  if (recoveryPublicKey === undefined) {
+    return { publicKey, privateKey, fields: resealed, bucket };
+  }
+  const recovery = await sealRecovery(privateKey, recoveryPublicKey, groupId);
+  return { publicKey, privateKey, fields: resealed, bucket, recovery };
 }

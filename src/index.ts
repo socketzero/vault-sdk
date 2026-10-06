@@ -118,6 +118,7 @@ export {
   NONCE_BYTES,
   parseEnvelope,
   parseEnvelopeBytes,
+  recoveryAssociatedData,
   TAG_BYTES,
 } from "./envelope.js";
 // --- key groups and buckets ------------------------------------------------
@@ -155,6 +156,11 @@ export {
   SECTION_KINDS,
   verifyBundle,
 } from "./inspect.js";
+// --- the recovery entry (adr/0035) -----------------------------------------
+//
+// K1 sealed to the group's recovery key K0, whose private half the 24-word
+// phrase encodes. `rotateGroup` writes one when given K0's public half.
+export { openRecovery, sealRecovery } from "./recovery.js";
 // --- branded key material: the only way to make a key out of bytes ---------
 //
 // A public half, a private half and an API key are all 32 raw bytes and all

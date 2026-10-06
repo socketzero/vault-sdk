@@ -309,6 +309,13 @@ export interface GroupRotation {
   readonly fields: readonly SealedField[];
   /** The rebuilt bucket: one entry per surviving API key, never empty. */
   readonly bucket: readonly BucketEntry[];
+  /**
+   * The new K1 sealed to the group's recovery key (K0), present exactly when
+   * `rotateGroup` was given K0's public half (`adr/0035`). A group that has a
+   * K0 must persist it with the rest of the generation, or the phrase stops
+   * recovering the group — the library cannot know whether the group has one.
+   */
+  readonly recovery?: SealedEnvelope;
 }
 
 // ---------------------------------------------------------------------------
