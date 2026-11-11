@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/socketzero/vault-sdk/compare/v0.4.0...v0.5.0) (2026-11-11)
+
+
+### Features
+
+* **bootstrap:** browser key-group bootstrap — reserve, generate, wrap, register ([#9](https://github.com/socketzero/vault-sdk/issues/9)) ([0778eda](https://github.com/socketzero/vault-sdk/commit/0778edab0694cdded502f0ffabeb6b0cfdb5a233))
+
 ## [0.4.0](https://github.com/socketzero/vault-sdk/compare/v0.3.1...v0.4.0) (2026-10-06)
 
 
