@@ -79,6 +79,30 @@ export {
   parseApiKey,
   WRAP_KEY_BYTES,
 } from "./api-key.js";
+// --- key-group bootstrap (protocol/tenant-management, bootstrap) -----------
+//
+// The one client-side operation that chains generateGroup, generateApiKey,
+// wrap and sealRecovery behind an acknowledged custody notice, and registers
+// the result through a `KeyGroupRegistrar` the caller passes in. The stock
+// adapter takes `fetch` as an argument, so the package still does no ambient I/O.
+export type {
+  BootstrapOptions,
+  BootstrappedKeyGroup,
+  CustodyNotice,
+  KeyGroupRegistrar,
+  RegisteredApiKey,
+  RegisteredKeyGroup,
+  RegisterKeyGroupRequest,
+  ReservedKeyGroupId,
+} from "./bootstrap.js";
+export {
+  bootstrapKeyGroup,
+  CustodyNotAcknowledgedError,
+  custodyNotice,
+  SECOND_KEY_RECOMMENDATION,
+  ShownAlreadyError,
+  ShowOnce,
+} from "./bootstrap.js";
 // --- the bundle ------------------------------------------------------------
 //
 // `decoyUnwrap` is offered, never imposed: lookup is synchronous and cannot
@@ -161,6 +185,8 @@ export {
 // K1 sealed to the group's recovery key K0, whose private half the 24-word
 // phrase encodes. `rotateGroup` writes one when given K0's public half.
 export { openRecovery, sealRecovery } from "./recovery.js";
+export type { HttpKeyGroupRegistrarOptions } from "./registrar-http.js";
+export { httpKeyGroupRegistrar, KeyGroupRegistrarError } from "./registrar-http.js";
 // --- branded key material: the only way to make a key out of bytes ---------
 //
 // A public half, a private half and an API key are all 32 raw bytes and all
