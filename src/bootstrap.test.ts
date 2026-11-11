@@ -6,8 +6,11 @@ import {
   CustodyNotAcknowledgedError,
   custodyNotice,
   type KeyGroupRegistrar,
+  KeyGroupRegistrarError,
+  KeyGroupRegistrarResponseError,
   type RegisteredKeyGroup,
   type RegisterKeyGroupRequest,
+  RegistrationOutcomeUnknownError,
   SECOND_KEY_RECOMMENDATION,
   ShownAlreadyError,
   ShowOnce,
@@ -24,6 +27,7 @@ import { asPrivateKey, asPublicKey, requireApiKey, VaultError } from "./types.js
 const minted = vi.hoisted(() => ({
   groups: [] as GroupKeyPair[],
   keys: [] as ApiKeyMaterial[],
+  wraps: [] as string[],
 }));
 vi.mock("./group.js", async (importOriginal) => {
   const original = await importOriginal<typeof import("./group.js")>();
@@ -33,6 +37,10 @@ vi.mock("./group.js", async (importOriginal) => {
       const pair = await original.generateGroup();
       minted.groups.push(pair);
       return pair;
+    },
+    wrap: (...args: Parameters<typeof original.wrap>) => {
+      minted.wraps.push(args[3]);
+      return original.wrap(...args);
     },
   };
 });
@@ -97,39 +105,43 @@ function fakeApi(overrides: Partial<KeyGroupRegistrar> = {}): FakeApi {
   return {
     calls,
     bodies,
-    reserveKeyGroupId: async (tenantId) => {
+    reserveKeyGroupId: async (tenantId, signal) => {
       calls.push(`reserve:${tenantId}`);
       return overrides.reserveKeyGroupId
-        ? overrides.reserveKeyGroupId(tenantId)
+        ? overrides.reserveKeyGroupId(tenantId, signal)
         : { id: RESERVED, expiresAt: 1_900_000_000 };
     },
-    registerKeyGroup: async (tenantId, body) => {
+    registerKeyGroup: async (tenantId, body, signal) => {
       calls.push(`register:${tenantId}`);
       assertRegisterBody(body);
       bodies.push(body);
       if (overrides.registerKeyGroup) {
-        return overrides.registerKeyGroup(tenantId, body);
+        return overrides.registerKeyGroup(tenantId, body, signal);
       }
-      const group: RegisteredKeyGroup = {
-        id: body.id,
-        name: body.name,
-        public_key: body.public_key,
-        generation: 0,
-        created_at: 1_800_000_000,
-        purpose: "tenant",
-        keys: [
-          {
-            key_id: body.key_id,
-            label: body.label ?? null,
-            created_at: 1_800_000_000,
-            kind: "tenant",
-          },
-        ],
-        recovery_public_key: body.recovery_public_key ?? null,
-        has_recovery: body.recovery_entry !== undefined,
-      };
-      return group;
+      return registered(body);
     },
+  };
+}
+
+/** What the register route stores for `body`. */
+function registered(body: RegisterKeyGroupRequest): RegisteredKeyGroup {
+  return {
+    id: body.id,
+    name: body.name,
+    public_key: body.public_key,
+    generation: 0,
+    created_at: 1_800_000_000,
+    purpose: "tenant",
+    keys: [
+      {
+        key_id: body.key_id,
+        label: body.label ?? null,
+        created_at: 1_800_000_000,
+        kind: "tenant",
+      },
+    ],
+    recovery_public_key: body.recovery_public_key ?? null,
+    has_recovery: body.recovery_entry !== undefined,
   };
 }
 
@@ -149,6 +161,24 @@ function options(
 
 function allZero(bytes: Uint8Array): boolean {
   return bytes.every((byte) => byte === 0);
+}
+
+function resetMinted(): void {
+  minted.groups.length = 0;
+  minted.keys.length = 0;
+  minted.wraps.length = 0;
+}
+
+/** The API key in `display` opens `body`'s bucket entry to the K1 whose public half it registered. */
+async function opensBody(display: string, body: RegisterKeyGroupRequest): Promise<boolean> {
+  const material = requireApiKey(parseApiKey(display));
+  const k1 = await unwrap(
+    { keyId: body.key_id, wrapped: base64Decode(body.wrapped) },
+    material.bytes,
+    TENANT,
+    body.id,
+  );
+  return base64Encode(await derivePublicKey(k1)) === body.public_key;
 }
 
 describe("bootstrapKeyGroup", () => {
@@ -177,8 +207,18 @@ describe("bootstrapKeyGroup", () => {
   });
 
   it("reserves, then wraps, then registers — all after custody is acknowledged", async () => {
+    resetMinted();
     const order: string[] = [];
-    const api = fakeApi();
+    const api = fakeApi({
+      reserveKeyGroupId: async () => {
+        order.push(`wraps-at-reserve:${minted.wraps.length}`);
+        return { id: RESERVED, expiresAt: 1 };
+      },
+      registerKeyGroup: async (_tenant, body) => {
+        order.push(`wraps-at-register:${minted.wraps.join(",")}`);
+        return registered(body);
+      },
+    });
     await bootstrapKeyGroup(
       options(api, {
         acknowledgeCustody: () => {
@@ -187,11 +227,8 @@ describe("bootstrapKeyGroup", () => {
         },
       }),
     );
-    expect([...order, ...api.calls]).toEqual([
-      "acknowledge",
-      `reserve:${TENANT}`,
-      `register:${TENANT}`,
-    ]);
+    expect(order).toEqual(["acknowledge", "wraps-at-reserve:0", `wraps-at-register:${RESERVED}`]);
+    expect(api.calls).toEqual([`reserve:${TENANT}`, `register:${TENANT}`]);
   });
 
   it("passes the group name, the label and the environment through", async () => {
@@ -293,26 +330,24 @@ describe("bootstrapKeyGroup", () => {
     }
   });
 
-  it("refuses a registration answer that names another group or another public half", async () => {
+  it("treats a registration answer naming another group or public half as an unknown outcome, keeping the keys", async () => {
     for (const lie of [
       { id: "0192f1a0-2222-7abc-8def-0123456789ab" },
       { public_key: `${"A".repeat(43)}=` },
     ]) {
       const api = fakeApi({
-        registerKeyGroup: async (_tenant, body) => ({
-          id: body.id,
-          name: body.name,
-          public_key: body.public_key,
-          generation: 0,
-          created_at: 0,
-          purpose: "tenant",
-          keys: [],
-          recovery_public_key: null,
-          has_recovery: false,
-          ...lie,
-        }),
+        registerKeyGroup: async (_tenant, body) => ({ ...registered(body), ...lie }),
       });
-      await expect(bootstrapKeyGroup(options(api))).rejects.toBeInstanceOf(VaultError);
+      const error = await bootstrapKeyGroup(options(api, { recoveryPhrase: true })).catch(
+        (caught: unknown) => caught,
+      );
+      expect(error).toBeInstanceOf(RegistrationOutcomeUnknownError);
+      expect(error).toBeInstanceOf(VaultError);
+      const unknown = error as RegistrationOutcomeUnknownError;
+      const body = api.bodies[0];
+      if (body === undefined) throw new Error("no body");
+      expect(await opensBody(unknown.apiKey.reveal(), body)).toBe(true);
+      expect(unknown.recoveryKey?.shown).toBe(false);
     }
   });
 
@@ -330,18 +365,157 @@ describe("bootstrapKeyGroup", () => {
     expect(k0 && allZero(k0.privateKey)).toBe(true);
   });
 
-  it("zeroizes every secret when registration fails", async () => {
-    minted.groups.length = 0;
-    minted.keys.length = 0;
-    const failure = new Error("409");
+  it("zeroizes every secret and propagates the refusal when the API definitively refuses (4xx)", async () => {
+    for (const status of [400, 401, 403, 404, 409, 410, 499]) {
+      resetMinted();
+      const failure = new KeyGroupRegistrarError(status, "conflict", "refused");
+      const api = fakeApi({
+        registerKeyGroup: async () => {
+          throw failure;
+        },
+      });
+      await expect(bootstrapKeyGroup(options(api, { recoveryPhrase: true }))).rejects.toBe(failure);
+      expect(minted.groups).toHaveLength(2);
+      for (const pair of minted.groups) expect(allZero(pair.privateKey)).toBe(true);
+      for (const key of minted.keys) expect(allZero(key.bytes)).toBe(true);
+    }
+  });
+
+  it("keeps the keys when registration may have landed: thrown fetch, 5xx, other status, unreadable 201", async () => {
+    const ambiguous: unknown[] = [
+      new TypeError("Failed to fetch"),
+      new DOMException("aborted", "AbortError"),
+      new KeyGroupRegistrarError(500, undefined, "boom"),
+      new KeyGroupRegistrarError(503, undefined, "boom"),
+      new KeyGroupRegistrarError(200, undefined, "odd"),
+      new KeyGroupRegistrarError(302, undefined, "odd"),
+      new KeyGroupRegistrarResponseError("key-groups", 201),
+      "a thrown string",
+    ];
+    for (const cause of ambiguous) {
+      resetMinted();
+      const api = fakeApi({
+        registerKeyGroup: async () => {
+          throw cause;
+        },
+      });
+      const error = await bootstrapKeyGroup(options(api, { recoveryPhrase: true })).catch(
+        (caught: unknown) => caught,
+      );
+      expect(error).toBeInstanceOf(RegistrationOutcomeUnknownError);
+      const unknown = error as RegistrationOutcomeUnknownError;
+      expect(unknown.cause).toBe(cause);
+      expect(unknown.groupId).toBe(RESERVED);
+      const body = api.bodies[0];
+      if (body === undefined) throw new Error("no body");
+      expect(unknown.publicKey).toBe(body.public_key);
+      // K1 and K2's raw bytes were done with at the wrap; only the shown-once
+      // display and K0 survive, for the person to keep.
+      const [k1, k0] = minted.groups;
+      expect(k1 && allZero(k1.privateKey)).toBe(true);
+      expect(k0 && allZero(k0.privateKey)).toBe(false);
+      expect(await opensBody(unknown.apiKey.reveal(), body)).toBe(true);
+      const recovery = unknown.recoveryKey?.reveal();
+      expect(recovery && base64Encode(await derivePublicKey(recovery))).toBe(
+        body.recovery_public_key,
+      );
+    }
+  });
+
+  it("carries no recovery key on an unknown outcome when no phrase was chosen", async () => {
     const api = fakeApi({
       registerKeyGroup: async () => {
-        throw failure;
+        throw new TypeError("Failed to fetch");
       },
     });
-    await expect(bootstrapKeyGroup(options(api, { recoveryPhrase: true }))).rejects.toBe(failure);
+    const error = (await bootstrapKeyGroup(options(api)).catch(
+      (caught: unknown) => caught,
+    )) as RegistrationOutcomeUnknownError;
+    expect(error).toBeInstanceOf(RegistrationOutcomeUnknownError);
+    expect(error.recoveryKey).toBeUndefined();
+  });
+
+  it("passes its signal to both registrar calls", async () => {
+    const controller = new AbortController();
+    const seen: (AbortSignal | undefined)[] = [];
+    const api = fakeApi({
+      reserveKeyGroupId: async (_tenant, signal) => {
+        seen.push(signal);
+        return { id: RESERVED, expiresAt: 1 };
+      },
+      registerKeyGroup: async (_tenant, body, signal) => {
+        seen.push(signal);
+        return registered(body);
+      },
+    });
+    await bootstrapKeyGroup(options(api, { signal: controller.signal }));
+    expect(seen).toEqual([controller.signal, controller.signal]);
+  });
+
+  it("stops before reserving when aborted during the notice, and zeroizes everything", async () => {
+    resetMinted();
+    const controller = new AbortController();
+    const api = fakeApi();
+    const reason = new Error("user left");
+    await expect(
+      bootstrapKeyGroup(
+        options(api, {
+          recoveryPhrase: true,
+          signal: controller.signal,
+          acknowledgeCustody: () => {
+            controller.abort(reason);
+            return true;
+          },
+        }),
+      ),
+    ).rejects.toBe(reason);
+    expect(api.calls).toEqual([]);
     for (const pair of minted.groups) expect(allZero(pair.privateKey)).toBe(true);
     for (const key of minted.keys) expect(allZero(key.bytes)).toBe(true);
+  });
+
+  it("stops before registering when aborted during the reservation, and zeroizes everything", async () => {
+    resetMinted();
+    const controller = new AbortController();
+    const reason = new Error("user left");
+    const api = fakeApi({
+      reserveKeyGroupId: async () => {
+        controller.abort(reason);
+        return { id: RESERVED, expiresAt: 1 };
+      },
+    });
+    await expect(
+      bootstrapKeyGroup(options(api, { recoveryPhrase: true, signal: controller.signal })),
+    ).rejects.toBe(reason);
+    expect(api.calls).toEqual([`reserve:${TENANT}`]);
+    for (const pair of minted.groups) expect(allZero(pair.privateKey)).toBe(true);
+  });
+
+  it("refuses a group name the API would refuse, before generating or reserving anything", async () => {
+    for (const name of ["", "a", "Default", "1abc", "abc-", "a_b", `a${"b".repeat(32)}`, "abc\n"]) {
+      resetMinted();
+      const api = fakeApi();
+      await expect(bootstrapKeyGroup(options(api, { name }))).rejects.toBeInstanceOf(VaultError);
+      expect(api.calls).toEqual([]);
+      expect(minted.groups).toHaveLength(0);
+    }
+    for (const name of ["ab", `a${"b".repeat(30)}c`, "prod-2"]) {
+      await expect(bootstrapKeyGroup(options(fakeApi(), { name }))).resolves.toBeDefined();
+    }
+  });
+
+  it("refuses a label the API would refuse — too long, a control character, or an API key", async () => {
+    const key = `sk0_live_${"A".repeat(43)}_${"b".repeat(6)}`;
+    for (const label of ["x".repeat(201), "tab\there", `my key ${key}`]) {
+      resetMinted();
+      const api = fakeApi();
+      await expect(bootstrapKeyGroup(options(api, { label }))).rejects.toBeInstanceOf(VaultError);
+      expect(api.calls).toEqual([]);
+      expect(minted.groups).toHaveLength(0);
+    }
+    await expect(
+      bootstrapKeyGroup(options(fakeApi(), { label: "x".repeat(200) })),
+    ).resolves.toBeDefined();
   });
 
   it("zeroizes every secret when custody is not acknowledged", async () => {
@@ -396,5 +570,20 @@ describe("ShowOnce", () => {
     expect(allZero(secret)).toBe(true);
     expect(() => once.reveal()).toThrow(ShownAlreadyError);
     once.discard();
+  });
+
+  it("keeps the secret when rendering throws, so a failed render does not destroy the only copy", () => {
+    const secret = new Uint8Array([5, 6]);
+    let fail = true;
+    const once = new ShowOnce(secret, (bytes) => {
+      if (fail) throw new Error("render failed");
+      return Array.from(bytes);
+    });
+    expect(() => once.reveal()).toThrow("render failed");
+    expect(once.shown).toBe(false);
+    expect(allZero(secret)).toBe(false);
+    fail = false;
+    expect(once.reveal()).toEqual([5, 6]);
+    expect(allZero(secret)).toBe(true);
   });
 });

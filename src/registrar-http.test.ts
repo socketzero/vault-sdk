@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { RegisteredKeyGroup, RegisterKeyGroupRequest } from "./bootstrap.js";
-import { httpKeyGroupRegistrar, KeyGroupRegistrarError } from "./registrar-http.js";
+import {
+  httpKeyGroupRegistrar,
+  KeyGroupRegistrarError,
+  KeyGroupRegistrarResponseError,
+} from "./registrar-http.js";
 import { VaultError } from "./types.js";
 
 const TENANT = "0192f1a0-0000-7000-8000-000000000001";
@@ -32,7 +36,7 @@ const GROUP: RegisteredKeyGroup = {
   generation: 0,
   created_at: 1,
   purpose: "tenant",
-  keys: [],
+  keys: [{ key_id: "0".repeat(32), label: null, created_at: 1, kind: "tenant" }],
   recovery_public_key: null,
   has_recovery: false,
 };
@@ -134,19 +138,121 @@ describe("httpKeyGroupRegistrar", () => {
         KeyGroupRegistrarError,
       );
     }
-    for (const payload of [
+  });
+
+  it("refuses a register 201 that is not the full KeyGroup shape, as an unreadable success", async () => {
+    const entry = GROUP.keys[0];
+    const malformed: unknown[] = [
+      null,
+      [],
       { ...GROUP, id: 7 },
+      { ...GROUP, name: undefined },
       { ...GROUP, public_key: undefined },
-    ]) {
+      { ...GROUP, generation: "0" },
+      { ...GROUP, generation: 0.5 },
+      { ...GROUP, created_at: "1" },
+      { ...GROUP, purpose: "other" },
+      { ...GROUP, keys: undefined },
+      { ...GROUP, keys: [null] },
+      { ...GROUP, keys: [{ ...entry, key_id: 1 }] },
+      { ...GROUP, keys: [{ ...entry, label: 1 }] },
+      { ...GROUP, keys: [{ ...entry, label: undefined }] },
+      { ...GROUP, keys: [{ ...entry, created_at: "1" }] },
+      { ...GROUP, keys: [{ ...entry, kind: "admin" }] },
+      { ...GROUP, recovery_public_key: undefined },
+      { ...GROUP, recovery_public_key: 1 },
+      { ...GROUP, has_recovery: "no" },
+    ];
+    for (const payload of malformed) {
       const { fetch } = fakeFetch(201, payload);
       const registrar = httpKeyGroupRegistrar({
         baseUrl: "https://api.example/v1",
         accessToken: "t",
         fetch,
       });
-      await expect(registrar.registerKeyGroup(TENANT, BODY)).rejects.toBeInstanceOf(
-        KeyGroupRegistrarError,
+      const error = await registrar
+        .registerKeyGroup(TENANT, BODY)
+        .catch((caught: unknown) => caught);
+      expect(error, JSON.stringify(payload)).toBeInstanceOf(KeyGroupRegistrarResponseError);
+      expect((error as KeyGroupRegistrarError).refused).toBe(false);
+    }
+  });
+
+  it("accepts every legal variant of the KeyGroup shape and returns only its declared fields", async () => {
+    const variants: RegisteredKeyGroup[] = [
+      { ...GROUP, purpose: "broker", keys: [] },
+      {
+        ...GROUP,
+        recovery_public_key: `${"C".repeat(43)}=`,
+        has_recovery: true,
+        keys: [
+          { key_id: "1".repeat(32), label: "laptop", created_at: 2, kind: "service" },
+          { key_id: "2".repeat(32), label: null, created_at: 3, kind: "tenant" },
+        ],
+      },
+    ];
+    for (const group of variants) {
+      const { fetch } = fakeFetch(201, { ...group, extra: "ignored" });
+      const registrar = httpKeyGroupRegistrar({
+        baseUrl: "https://api.example/v1",
+        accessToken: "t",
+        fetch,
+      });
+      expect(await registrar.registerKeyGroup(TENANT, BODY)).toEqual(group);
+    }
+  });
+
+  it("classifies only a 4xx as a definitive refusal", async () => {
+    for (const [status, refused] of [
+      [400, true],
+      [409, true],
+      [410, true],
+      [499, true],
+      [399, false],
+      [500, false],
+      [200, false],
+    ] as const) {
+      expect(new KeyGroupRegistrarError(status, undefined, "x").refused, String(status)).toBe(
+        refused,
       );
     }
+    expect(new KeyGroupRegistrarResponseError("key-groups", 201).status).toBe(201);
+  });
+
+  it("calls fetch detached from the options object, as a browser's native fetch requires", async () => {
+    const { fetch: inner, seen } = fakeFetch(201, { id: GROUP.id, expires_at: 1 });
+    // A native fetch throws `TypeError: Illegal invocation` for any `this` but
+    // the global object or undefined.
+    const strictFetch = function (
+      this: unknown,
+      input: string | URL | Request,
+      init?: RequestInit,
+    ) {
+      if (this !== undefined && this !== globalThis) {
+        throw new TypeError("Illegal invocation");
+      }
+      return inner(input, init);
+    } as typeof globalThis.fetch;
+    const registrar = httpKeyGroupRegistrar({
+      baseUrl: "https://api.example/v1",
+      accessToken: "t",
+      fetch: strictFetch,
+    });
+    await registrar.reserveKeyGroupId(TENANT);
+    expect(seen).toHaveLength(1);
+  });
+
+  it("passes the caller's signal to fetch, and sends none when not given one", async () => {
+    const controller = new AbortController();
+    const { fetch, seen } = fakeFetch(201, GROUP);
+    const registrar = httpKeyGroupRegistrar({
+      baseUrl: "https://api.example/v1",
+      accessToken: "t",
+      fetch,
+    });
+    await registrar.registerKeyGroup(TENANT, BODY, controller.signal);
+    await registrar.registerKeyGroup(TENANT, BODY);
+    expect(seen[0]?.init?.signal).toBe(controller.signal);
+    expect(seen[1]?.init !== undefined && "signal" in seen[1].init).toBe(false);
   });
 });

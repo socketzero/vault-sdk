@@ -24,11 +24,20 @@
  * the caller passes in (`httpKeyGroupRegistrar` is the stock adapter), so this
  * module keeps the package's "every input is an argument" rule.
  *
+ * **A failure that may have registered the group keeps the keys.** The register
+ * route has no DELETE, and a retried register answers 409, so a group that
+ * landed while its reply was lost is a group no wiped key can ever open. Only a
+ * definitive refusal (a 4xx, before anything was written) zeroizes; a thrown
+ * fetch, an abort, a 5xx, an unreadable 201 or an answer naming another group
+ * throws `RegistrationOutcomeUnknownError` carrying K2 (and K0) show-once.
+ *
  * **Zeroizing is best effort, and only for bytes.** K1's private half and K2's
  * raw bytes are overwritten as soon as the wrap no longer needs them, and every
- * secret is overwritten on any failure. A JavaScript string cannot be
- * overwritten, so K2's display form is held as bytes and decoded only at the
- * moment it is revealed; the string the caller then holds is theirs to drop.
+ * secret is overwritten on a failure that registered nothing. A JavaScript
+ * string cannot be overwritten: `generateApiKey` returns K2's display form as a
+ * string, and that string exists from minting until it is garbage-collected,
+ * whatever this module does. The show-once copy is a byte buffer that is wiped
+ * on reveal; it adds no guarantee for the original string.
  *
  * **The phrase's words are not rendered here.** `adr/0035` keeps phrase
  * encoding where a person sees it, so K0 is returned as its 32-byte private
@@ -109,19 +118,99 @@ export interface RegisteredKeyGroup {
  * from: the options of the bootstrap that also salts the derivations with it.
  */
 export interface KeyGroupRegistrar {
-  reserveKeyGroupId(tenantId: string): Promise<ReservedKeyGroupId>;
-  registerKeyGroup(tenantId: string, body: RegisterKeyGroupRequest): Promise<RegisteredKeyGroup>;
+  reserveKeyGroupId(tenantId: string, signal?: AbortSignal): Promise<ReservedKeyGroupId>;
+  /**
+   * Throw a `KeyGroupRegistrarError` with a 4xx `status` only when the API
+   * definitively created nothing. Anything else thrown is read as "the group
+   * may exist", and the bootstrap keeps the keys.
+   */
+  registerKeyGroup(
+    tenantId: string,
+    body: RegisterKeyGroupRequest,
+    signal?: AbortSignal,
+  ): Promise<RegisteredKeyGroup>;
 }
 
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
+/**
+ * A key-group route refused, or answered in a way that is not its declared
+ * success. `status` is the HTTP status; `apiError` is the API's `error` string
+ * when the body had one.
+ *
+ * Statuses worth acting on, from the register route: `409` the name is taken or
+ * the reservation was already used, `410` the reservation expired.
+ */
+export class KeyGroupRegistrarError extends VaultError {
+  readonly status: number;
+  readonly apiError: string | undefined;
+  constructor(status: number, apiError: string | undefined, message: string) {
+    super(message);
+    this.name = "KeyGroupRegistrarError";
+    this.status = status;
+    this.apiError = apiError;
+  }
+
+  /** A 4xx: the API answered before writing anything. Every other status may follow a write. */
+  get refused(): boolean {
+    return this.status >= 400 && this.status < 500;
+  }
+}
+
+/**
+ * The route answered success, but with a body that is not its declared shape.
+ * For the register route this means the group was very likely created.
+ */
+export class KeyGroupRegistrarResponseError extends KeyGroupRegistrarError {
+  constructor(path: string, status: number) {
+    super(status, undefined, `${path} answered ${status} with a body of the wrong shape`);
+    this.name = "KeyGroupRegistrarResponseError";
+  }
+}
+
 /** The tenant did not acknowledge the custody notice. Nothing was reserved or registered. */
 export class CustodyNotAcknowledgedError extends VaultError {
   constructor() {
     super("custody of the API key was not acknowledged, so no key group was registered");
     this.name = "CustodyNotAcknowledgedError";
+  }
+}
+
+/**
+ * The register request may have created the group, but this call cannot tell:
+ * the fetch failed or was aborted after sending, the API answered a 5xx or an
+ * unreadable success, or the answer named another group. `cause` says which.
+ *
+ * The keys are NOT wiped: if the group exists, they are its only keys. Show
+ * `apiKey` (and `recoveryKey`) exactly as on success, then look for `groupId`
+ * with `publicKey` in `GET /tenants/{tenantId}/key-groups`. If it is not there,
+ * discard both and bootstrap again.
+ */
+export class RegistrationOutcomeUnknownError extends VaultError {
+  readonly groupId: string;
+  /** K1's public half, base64, as sent. */
+  readonly publicKey: string;
+  readonly apiKey: ShowOnce<string>;
+  readonly recoveryKey: ShowOnce<PrivateKey> | undefined;
+  constructor(
+    secrets: Pick<BootstrappedKeyGroup, "apiKey" | "recoveryKey">,
+    groupId: string,
+    publicKey: string,
+    cause: unknown,
+  ) {
+    super(
+      `key group ${groupId} may have been registered; keep its keys and check before retrying`,
+      {
+        cause,
+      },
+    );
+    this.name = "RegistrationOutcomeUnknownError";
+    this.groupId = groupId;
+    this.publicKey = publicKey;
+    this.apiKey = secrets.apiKey;
+    this.recoveryKey = secrets.recoveryKey;
   }
 }
 
@@ -163,7 +252,8 @@ export class ShowOnce<T> {
   }
 
   /**
-   * The secret, once.
+   * The secret, once. If `render` throws, nothing is consumed and the secret
+   * can be revealed again: a failed render must not destroy the only copy.
    *
    * @throws {ShownAlreadyError} on every call after the first, and after `discard`.
    */
@@ -172,12 +262,10 @@ export class ShowOnce<T> {
     if (secret === undefined) {
       throw new ShownAlreadyError();
     }
+    const shown = this.#render(secret);
     this.#secret = undefined;
-    try {
-      return this.#render(secret);
-    } finally {
-      secret.fill(0);
-    }
+    secret.fill(0);
+    return shown;
   }
 
   /** Overwrite the secret without revealing it. Idempotent. */
@@ -242,6 +330,11 @@ export interface BootstrapOptions {
    * acknowledgement. Anything but `true` aborts with nothing reserved or registered.
    */
   readonly acknowledgeCustody: (notice: CustodyNotice) => boolean | Promise<boolean>;
+  /**
+   * Cancels the bootstrap. Before the register request it aborts with nothing
+   * registered; during it, the outcome is unknown (`RegistrationOutcomeUnknownError`).
+   */
+  readonly signal?: AbortSignal;
 }
 
 export interface BootstrappedKeyGroup {
@@ -260,20 +353,52 @@ const RESERVED_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 
 const DEFAULT_GROUP_NAME = "default";
 
+/** socket0-api `GROUP_NAME`. */
+const GROUP_NAME = /^[a-z][a-z0-9-]{0,30}[a-z0-9]$/;
+/** socket0-api `keyGroupLabelForTests`: at most 200 characters, no control characters, no API key. */
+const LABEL_MAX = 200;
+const LABEL_CHARS = /^[^\p{C}]*$/u;
+/** socket0-api `API_KEY_ANYWHERE`. */
+const API_KEY_ANYWHERE = /sk0_[a-z]+_[0-9A-Za-z]{43}_[0-9A-Za-z]{6}/;
+
+/** Refuse what the register route would refuse, before a reservation and a keygen are spent on it. */
+function checkNameAndLabel(name: string, label: string | undefined): void {
+  if (!GROUP_NAME.test(name)) {
+    throw new VaultError("a key-group name is 2-32 of a-z, 0-9 and '-', starting with a letter");
+  }
+  if (
+    label !== undefined &&
+    (label.length > LABEL_MAX || !LABEL_CHARS.test(label) || API_KEY_ANYWHERE.test(label))
+  ) {
+    throw new VaultError(
+      "a key-group label is at most 200 characters, with no control characters and no API key",
+    );
+  }
+}
+
+/** A refusal the API answered before writing: the group certainly does not exist. */
+function definitivelyRefused(error: unknown): boolean {
+  return error instanceof KeyGroupRegistrarError && error.refused;
+}
+
 /**
  * Create a key group on this machine and register it: reserve, generate, wrap,
  * register, under an acknowledged custody notice.
  *
+ * @throws {VaultError} when `name` or `label` is one the API refuses, before
+ *   anything is generated, or when the reserved id is not a canonical UUIDv7 —
+ *   wrapping against a second spelling of an id makes an entry nothing can open.
  * @throws {CustodyNotAcknowledgedError} when `acknowledgeCustody` resolves to
  *   anything but `true`. Nothing has been reserved or registered.
- * @throws {VaultError} when the reserved id is not a canonical UUIDv7 — wrapping
- *   against a second spelling of an id makes an entry nothing can open — or when
- *   the registration answer names another group or public half.
- * Errors from the registrar propagate unchanged. On every failure each secret
- * this call produced is overwritten before it throws.
+ * @throws {RegistrationOutcomeUnknownError} when the register request may have
+ *   created the group. It carries the keys, unwiped and show-once.
+ * Other errors — the reservation's, the signal's reason, and a register 4xx —
+ * propagate unchanged, and each secret this call produced is overwritten first.
  */
 export async function bootstrapKeyGroup(options: BootstrapOptions): Promise<BootstrappedKeyGroup> {
-  const { registrar, tenantId } = options;
+  const { registrar, tenantId, signal } = options;
+  const name = options.name ?? DEFAULT_GROUP_NAME;
+  checkNameAndLabel(name, options.label);
   const k1 = await generateGroup();
   const k2 = generateApiKey(options.environment);
   const k0 = options.recoveryPhrase ? await generateGroup() : undefined;
@@ -289,7 +414,8 @@ export async function bootstrapKeyGroup(options: BootstrapOptions): Promise<Boot
       throw new CustodyNotAcknowledgedError();
     }
 
-    const { id } = await registrar.reserveKeyGroupId(tenantId);
+    signal?.throwIfAborted();
+    const { id } = await registrar.reserveKeyGroupId(tenantId, signal);
     if (!RESERVED_ID.test(id)) {
       throw new VaultError("the reserved key-group id is not a canonical lowercase UUIDv7");
     }
@@ -304,7 +430,7 @@ export async function bootstrapKeyGroup(options: BootstrapOptions): Promise<Boot
     const publicKey = base64Encode(k1.publicKey);
     const body: RegisterKeyGroupRequest = {
       id,
-      name: options.name ?? DEFAULT_GROUP_NAME,
+      name,
       public_key: publicKey,
       key_id: entry.keyId,
       wrapped: base64Encode(entry.wrapped),
@@ -312,23 +438,39 @@ export async function bootstrapKeyGroup(options: BootstrapOptions): Promise<Boot
       custody_acknowledged: true,
       ...recovery,
     };
-    const group = await registrar.registerKeyGroup(tenantId, body);
+    signal?.throwIfAborted();
+
+    // From here on the group may exist, so the keys are handed over on every
+    // path except a definitive refusal.
+    const handOver = (): Pick<BootstrappedKeyGroup, "apiKey" | "recoveryKey"> => {
+      handedOver = true;
+      const apiKey = new ShowOnce(display, utf8Decode);
+      return k0 === undefined
+        ? { apiKey }
+        : {
+            apiKey,
+            recoveryKey: new ShowOnce(k0.privateKey, (bytes) =>
+              asPrivateKey(Uint8Array.from(bytes)),
+            ),
+          };
+    };
+    let group: RegisteredKeyGroup;
+    try {
+      group = await registrar.registerKeyGroup(tenantId, body, signal);
+    } catch (error) {
+      if (definitivelyRefused(error)) throw error;
+      throw new RegistrationOutcomeUnknownError(handOver(), id, publicKey, error);
+    }
     if (group.id !== id || group.public_key !== publicKey) {
-      throw new VaultError("the registered key group is not the one this bootstrap created");
+      throw new RegistrationOutcomeUnknownError(
+        handOver(),
+        id,
+        publicKey,
+        new VaultError("the registered key group is not the one this bootstrap created"),
+      );
     }
 
-    handedOver = true;
-    const result: BootstrappedKeyGroup = {
-      group,
-      apiKey: new ShowOnce(display, utf8Decode),
-      recommendation: SECOND_KEY_RECOMMENDATION,
-    };
-    return k0 === undefined
-      ? result
-      : {
-          ...result,
-          recoveryKey: new ShowOnce(k0.privateKey, (bytes) => asPrivateKey(Uint8Array.from(bytes))),
-        };
+    return { group, ...handOver(), recommendation: SECOND_KEY_RECOMMENDATION };
   } finally {
     if (!handedOver) {
       k1.privateKey.fill(0);

@@ -99,6 +99,7 @@ export {
   bootstrapKeyGroup,
   CustodyNotAcknowledgedError,
   custodyNotice,
+  RegistrationOutcomeUnknownError,
   SECOND_KEY_RECOMMENDATION,
   ShownAlreadyError,
   ShowOnce,
@@ -186,7 +187,11 @@ export {
 // phrase encodes. `rotateGroup` writes one when given K0's public half.
 export { openRecovery, sealRecovery } from "./recovery.js";
 export type { HttpKeyGroupRegistrarOptions } from "./registrar-http.js";
-export { httpKeyGroupRegistrar, KeyGroupRegistrarError } from "./registrar-http.js";
+export {
+  httpKeyGroupRegistrar,
+  KeyGroupRegistrarError,
+  KeyGroupRegistrarResponseError,
+} from "./registrar-http.js";
 // --- branded key material: the only way to make a key out of bytes ---------
 //
 // A public half, a private half and an API key are all 32 raw bytes and all

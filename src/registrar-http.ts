@@ -10,13 +10,17 @@
  * browser, a worker and a test all hand in their own.
  */
 
-import type {
-  KeyGroupRegistrar,
-  RegisteredKeyGroup,
-  RegisterKeyGroupRequest,
-  ReservedKeyGroupId,
+import {
+  type KeyGroupRegistrar,
+  KeyGroupRegistrarError,
+  KeyGroupRegistrarResponseError,
+  type RegisteredApiKey,
+  type RegisteredKeyGroup,
+  type RegisterKeyGroupRequest,
+  type ReservedKeyGroupId,
 } from "./bootstrap.js";
-import { VaultError } from "./types.js";
+
+export { KeyGroupRegistrarError, KeyGroupRegistrarResponseError };
 
 /** Both routes answer `201` on success and nothing else. */
 const CREATED = 201;
@@ -26,51 +30,41 @@ export interface HttpKeyGroupRegistrarOptions {
   readonly baseUrl: string;
   /** The person's access token, or a function returning a current one. */
   readonly accessToken: string | (() => string | Promise<string>);
+  /** Called detached (`this` undefined), so a browser's native `fetch` can be passed as is. */
   readonly fetch: typeof globalThis.fetch;
 }
 
 /**
- * A key-group route refused, or answered with a body that is not its declared
- * shape. `status` is the HTTP status; `apiError` is the API's `error` string
- * when the body had one.
- *
- * Statuses worth acting on, from the register route: `409` the name is taken or
- * the reservation was already used, `410` the reservation expired.
+ * A non-201 answer is a `KeyGroupRegistrarError` with that status; a 201 whose
+ * body is not the route's declared shape is a `KeyGroupRegistrarResponseError`,
+ * which for the register route means the group very likely exists.
  */
-export class KeyGroupRegistrarError extends VaultError {
-  readonly status: number;
-  readonly apiError: string | undefined;
-  constructor(status: number, apiError: string | undefined, message: string) {
-    super(message);
-    this.name = "KeyGroupRegistrarError";
-    this.status = status;
-    this.apiError = apiError;
-  }
-}
-
 export function httpKeyGroupRegistrar(options: HttpKeyGroupRegistrarOptions): KeyGroupRegistrar {
   const root = options.baseUrl.replace(/\/+$/, "");
+  // Detached: `options.fetch(...)` would call it with `this === options`, and a
+  // browser's or a Worker's native fetch throws "Illegal invocation" for that.
+  const doFetch = options.fetch;
 
   async function post(
     tenantId: string,
     path: string,
-    body?: RegisterKeyGroupRequest,
+    body: RegisterKeyGroupRequest | undefined,
+    signal: AbortSignal | undefined,
   ): Promise<unknown> {
     const token =
       typeof options.accessToken === "string" ? options.accessToken : await options.accessToken();
     const authorization = `Bearer ${token}`;
-    const init: RequestInit =
-      body === undefined
-        ? { method: "POST", headers: { authorization } }
+    const init: RequestInit = {
+      method: "POST",
+      ...(body === undefined
+        ? { headers: { authorization } }
         : {
-            method: "POST",
             headers: { authorization, "content-type": "application/json" },
             body: JSON.stringify(body),
-          };
-    const response = await options.fetch(
-      `${root}/tenants/${encodeURIComponent(tenantId)}/${path}`,
-      init,
-    );
+          }),
+      ...(signal === undefined ? {} : { signal }),
+    };
+    const response = await doFetch(`${root}/tenants/${encodeURIComponent(tenantId)}/${path}`, init);
     const payload: unknown = await response.json().catch(() => undefined);
     if (response.status !== CREATED) {
       const apiError =
@@ -85,14 +79,14 @@ export function httpKeyGroupRegistrar(options: HttpKeyGroupRegistrarOptions): Ke
   }
 
   return {
-    async reserveKeyGroupId(tenantId: string): Promise<ReservedKeyGroupId> {
-      const payload = await post(tenantId, "key-group-ids");
+    async reserveKeyGroupId(tenantId: string, signal?: AbortSignal): Promise<ReservedKeyGroupId> {
+      const payload = await post(tenantId, "key-group-ids", undefined, signal);
       if (
         !isRecord(payload) ||
         typeof payload["id"] !== "string" ||
         typeof payload["expires_at"] !== "number"
       ) {
-        throw malformed("key-group-ids");
+        throw new KeyGroupRegistrarResponseError("key-group-ids", CREATED);
       }
       return { id: payload["id"], expiresAt: payload["expires_at"] };
     },
@@ -100,30 +94,72 @@ export function httpKeyGroupRegistrar(options: HttpKeyGroupRegistrarOptions): Ke
     async registerKeyGroup(
       tenantId: string,
       body: RegisterKeyGroupRequest,
+      signal?: AbortSignal,
     ): Promise<RegisteredKeyGroup> {
-      const payload = await post(tenantId, "key-groups", body);
-      // The bootstrap compares these two against what it sent; the rest is the
-      // API's own published shape and is passed through as it came.
-      if (
-        !isRecord(payload) ||
-        typeof payload["id"] !== "string" ||
-        typeof payload["public_key"] !== "string"
-      ) {
-        throw malformed("key-groups");
+      const payload = await post(tenantId, "key-groups", body, signal);
+      const group = keyGroup(payload);
+      if (group === undefined) {
+        throw new KeyGroupRegistrarResponseError("key-groups", CREATED);
       }
-      return payload as unknown as RegisteredKeyGroup;
+      return group;
     },
+  };
+}
+
+/** The register route's `KeyGroup`, field for field, or `undefined` when the body is not one. */
+function keyGroup(value: unknown): RegisteredKeyGroup | undefined {
+  if (
+    !isRecord(value) ||
+    typeof value["id"] !== "string" ||
+    typeof value["name"] !== "string" ||
+    typeof value["public_key"] !== "string" ||
+    !Number.isInteger(value["generation"]) ||
+    typeof value["created_at"] !== "number" ||
+    (value["purpose"] !== "tenant" && value["purpose"] !== "broker") ||
+    !Array.isArray(value["keys"]) ||
+    (value["recovery_public_key"] !== null && typeof value["recovery_public_key"] !== "string") ||
+    typeof value["has_recovery"] !== "boolean"
+  ) {
+    return undefined;
+  }
+  const keys: RegisteredApiKey[] = [];
+  for (const entry of value["keys"] as unknown[]) {
+    const key = apiKeySummary(entry);
+    if (key === undefined) return undefined;
+    keys.push(key);
+  }
+  return {
+    id: value["id"],
+    name: value["name"],
+    public_key: value["public_key"],
+    generation: value["generation"] as number,
+    created_at: value["created_at"],
+    purpose: value["purpose"],
+    keys,
+    recovery_public_key: value["recovery_public_key"],
+    has_recovery: value["has_recovery"],
+  };
+}
+
+/** `ApiKeySummary`, or `undefined`. */
+function apiKeySummary(value: unknown): RegisteredApiKey | undefined {
+  if (
+    !isRecord(value) ||
+    typeof value["key_id"] !== "string" ||
+    (value["label"] !== null && typeof value["label"] !== "string") ||
+    typeof value["created_at"] !== "number" ||
+    (value["kind"] !== "tenant" && value["kind"] !== "service")
+  ) {
+    return undefined;
+  }
+  return {
+    key_id: value["key_id"],
+    label: value["label"],
+    created_at: value["created_at"],
+    kind: value["kind"],
   };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function malformed(path: string): KeyGroupRegistrarError {
-  return new KeyGroupRegistrarError(
-    CREATED,
-    undefined,
-    `${path} answered 201 with a body of the wrong shape`,
-  );
 }
