@@ -176,7 +176,11 @@ function rotationMaterial(value: unknown): RotationMaterial | undefined {
     everyRecord(
       value["auth_apps"],
       (a) => typeof a["id"] === "string" && typeof a["sealed_client_secret"] === "string",
-    );
+    ) &&
+    isRecord(value["challenge"]) &&
+    typeof value["challenge"]["id"] === "string" &&
+    typeof value["challenge"]["sealed_nonce"] === "string" &&
+    Number.isInteger(value["challenge"]["expires_at"]);
   return ok ? (value as unknown as RotationMaterial) : undefined;
 }
 

@@ -268,6 +268,7 @@ describe("httpKeyGroupRotator", () => {
     keys: [{ key_id: "0".repeat(32), wrapped: "B".repeat(80), label: null, created_at: 1 }],
     connections: [{ id: "c", version: 1, sealed: { password: "x25519-hkdf-aesgcm:AAAA" } }],
     auth_apps: [{ id: "a", sealed_client_secret: "x25519-hkdf-aesgcm:AAAA" }],
+    challenge: { id: "ch", sealed_nonce: "x25519-hkdf-aesgcm:AAAA", expires_at: 300 },
   };
   const COMMIT = {
     expected_generation: 2,
@@ -275,6 +276,8 @@ describe("httpKeyGroupRotator", () => {
     keys: [{ key_id: "0".repeat(32), wrapped: "B".repeat(80) }],
     connections: [],
     auth_apps: [],
+    challenge_id: "ch",
+    challenge_nonce: "A".repeat(43) + "=",
   };
 
   it("fetches the group's rotation material with a bearer-authenticated GET", async () => {
@@ -309,6 +312,19 @@ describe("httpKeyGroupRotator", () => {
     expect(seen[0]?.init?.signal).toBe(controller.signal);
   });
 
+  it("surfaces a 403's reason on the error: the proof of possession was refused", async () => {
+    const { fetch } = fakeFetch(403, { error: "proof required" });
+    const rotator = httpKeyGroupRotator({
+      baseUrl: "https://api.example/v1",
+      accessToken: "tok",
+      fetch,
+    });
+    const err = await rotator.commitRotation(TENANT, GROUP_ID, COMMIT).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(KeyGroupRegistrarError);
+    expect((err as KeyGroupRegistrarError).status).toBe(403);
+    expect((err as KeyGroupRegistrarError).apiError).toBe("proof required");
+  });
+
   it("surfaces a 409's reason on the error", async () => {
     const { fetch } = fakeFetch(409, { error: "stale" });
     const rotator = httpKeyGroupRotator({
@@ -336,6 +352,17 @@ describe("httpKeyGroupRotator", () => {
     ["a connection without sealed", { ...MATERIAL, connections: [{ id: "c", version: 1 }] }],
     ["an app that is not an object", { ...MATERIAL, auth_apps: ["a"] }],
     ["an app without its copy", { ...MATERIAL, auth_apps: [{ id: "a" }] }],
+    ["no challenge", { ...MATERIAL, challenge: undefined }],
+    ["a challenge that is not an object", { ...MATERIAL, challenge: "ch" }],
+    ["a challenge without an id", { ...MATERIAL, challenge: { ...MATERIAL.challenge, id: 1 } }],
+    [
+      "a challenge without its nonce",
+      { ...MATERIAL, challenge: { ...MATERIAL.challenge, sealed_nonce: undefined } },
+    ],
+    [
+      "a challenge with a fractional expiry",
+      { ...MATERIAL, challenge: { ...MATERIAL.challenge, expires_at: 1.5 } },
+    ],
   ])("refuses fetched material with %s", async (_what, body) => {
     const { fetch } = fakeFetch(200, body);
     const rotator = httpKeyGroupRotator({

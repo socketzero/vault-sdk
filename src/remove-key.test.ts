@@ -14,7 +14,7 @@ import { deriveKeyIdHex, generateApiKey } from "./api-key.js";
 import { KeyGroupRegistrarError } from "./bootstrap.js";
 import { parseUuid } from "./bundle/layout.js";
 import { base64Decode, base64Encode, utf8Decode, utf8Encode } from "./encoding.js";
-import { fieldAssociatedData, open, seal } from "./envelope.js";
+import { bucketAssociatedData, fieldAssociatedData, open, seal } from "./envelope.js";
 import { buildBucket, findBucketEntry, generateGroup, unwrap } from "./group.js";
 import { openRecovery, sealRecovery } from "./recovery.js";
 import { httpKeyGroupRotator } from "./registrar-http.js";
@@ -266,6 +266,8 @@ describe("removeKey", () => {
     expect(sent["expected_generation"]).toBe(4);
     expect(Object.keys(sent).sort()).toEqual([
       "auth_apps",
+      "challenge_id",
+      "challenge_nonce",
       "connections",
       "expected_generation",
       "keys",
@@ -273,6 +275,10 @@ describe("removeKey", () => {
       "recovery_entry",
       "recovery_public_key",
     ]);
+    // The proof: fetch-group's challenge, opened with the CURRENT K1 and sent back.
+    const challenge = w.api.challenges.get(sent["challenge_id"] as string);
+    expect(sent["challenge_nonce"]).toBe(challenge?.nonce);
+    expect(challenge?.spent).toBe(true);
   });
 
   it("removes the key it is called with even when the caller also holds it", async () => {
@@ -439,6 +445,11 @@ describe("removeKey", () => {
       ["POST", 200],
     ]);
     expect(w.group.generation).toBe(5);
+    // Each round answers the challenge its own fetch minted.
+    const posted = w.api.calls
+      .filter((x) => x.method === "POST")
+      .map((x) => (x.body as Record<string, unknown>)["challenge_id"]);
+    expect(new Set(posted).size).toBe(2);
   });
 
   it("gives up after maxAttempts stale commits with the API's 409", async () => {
@@ -657,4 +668,68 @@ describe("removeKey", () => {
       expect(w.api.calls).toHaveLength(0);
     },
   );
+
+  describe("proof of possession of the current K1", () => {
+    const run = (w: World) =>
+      removeKey({
+        rotator: rotator(w.api),
+        tenantId: TENANT,
+        groupId: GROUP_ID,
+        keyId: w.keyIds[1] as string,
+        survivingKeys: [(w.keys[0] as ApiKeyMaterial).bytes],
+      }).catch((e: unknown) => e);
+
+    it("propagates the API's 403 without retrying, and nothing lands", async () => {
+      const w = await world(2, false);
+      // The challenge is gone by the time the commit is judged.
+      w.api.beforeCommit = () => w.api.challenges.clear();
+      const err = await run(w);
+      expect(err).toBeInstanceOf(KeyGroupRegistrarError);
+      expect((err as KeyGroupRegistrarError).status).toBe(403);
+      expect((err as KeyGroupRegistrarError).apiError).toBe("proof invalid");
+      expect(w.api.calls.map((x) => [x.method, x.status])).toEqual([
+        ["GET", 200],
+        ["POST", 403],
+      ]);
+      expect(w.group.generation).toBe(4);
+    });
+
+    it.each([
+      [
+        "sealed to a key other than the group's",
+        async (c: { id: string }) =>
+          seal(
+            new Uint8Array(32),
+            (await generateGroup()).publicKey,
+            bucketAssociatedData(GROUP_ID, `rotation-challenge:${c.id}`),
+          ),
+      ],
+      [
+        "not 32 bytes",
+        async (c: { id: string }, w: World) =>
+          seal(
+            new Uint8Array(31),
+            w.k1.publicKey,
+            bucketAssociatedData(GROUP_ID, `rotation-challenge:${c.id}`),
+          ),
+      ],
+      [
+        "a connection's sealed field - the server asking the SDK to decrypt it",
+        async (_c: { id: string }, w: World) =>
+          w.api.state.connections.find((x) => x.id === CONN_BARE)?.config["password"] as string,
+      ],
+      ["not an envelope at all", async () => "garbage"],
+    ])("refuses a challenge %s, and sends nothing back", async (_what, forge) => {
+      const w = await world(2, false);
+      w.api.tamperChallenge = async (honest) => ({
+        ...honest,
+        sealed_nonce: await forge(honest, w),
+      });
+      const err = await run(w);
+      expect(err).toBeInstanceOf(KeyRemovalRefusedError);
+      expect((err as KeyRemovalRefusedError).reason).toBe("inconsistent-material");
+      expect(w.api.calls.map((x) => x.method)).toEqual(["GET"]);
+      expect(w.group.generation).toBe(4);
+    });
+  });
 });

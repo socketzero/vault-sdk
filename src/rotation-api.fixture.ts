@@ -14,12 +14,23 @@
  *   - `409` with `stale`, `incomplete`, `unknown key`, `recovery entry
  *     required` or `public key not new`, and nothing written;
  *   - fetch-group never returns the recovery entry, and seals are found by
- *     SHAPE: every top-level config string that is an envelope.
+ *     SHAPE: every top-level config string that is an envelope;
+ *   - fetch-group mints a single-use challenge: 32 random bytes sealed to the
+ *     group's current public half under
+ *     `bucketAssociatedData(group id, "rotation-challenge:" + id)`. The commit
+ *     must carry `challenge_id` and `challenge_nonce` (base64 of the opened
+ *     bytes): absent is `403 proof required`; wrong, another group's, or an
+ *     earlier generation's sent with a generation other than its own is
+ *     `403 proof invalid`; spent is `409 stale`. A landed commit spends it.
  *
- * Nothing here is cryptographic. The server cannot open anything, and neither
- * can this fake: whether the SDK resealed correctly is for the test to prove by
- * opening what was stored.
+ * The only cryptography here is that `seal`, which needs no secret. The server
+ * cannot open anything, and neither can this fake: whether the SDK resealed
+ * correctly is for the test to prove by opening what was stored.
  */
+
+import { base64Decode, base64Encode } from "./encoding.js";
+import { bucketAssociatedData, seal } from "./envelope.js";
+import { asPublicKey } from "./types.js";
 
 export const FAKE_BASE_URL = "https://api.test/v1";
 export const FAKE_TOKEN = "user-jwt";
@@ -82,6 +93,28 @@ export interface FakeRotationApi {
   readonly calls: FakeCall[];
   /** Runs once per commit, before it is judged — where a concurrent writer goes. */
   beforeCommit: (() => void) | undefined;
+  /** Every challenge minted, by id: the nonce as base64, and whether it was spent. */
+  readonly challenges: Map<string, FakeChallenge>;
+  /**
+   * Replaces the challenge fetch-group would send — where a server that lies
+   * about it goes. Receives the honest one, already stored.
+   */
+  tamperChallenge:
+    | ((honest: SentChallenge, group: FakeGroup) => Promise<SentChallenge>)
+    | undefined;
+}
+
+export interface FakeChallenge {
+  readonly groupId: string;
+  readonly generation: number;
+  readonly nonce: string;
+  spent: boolean;
+}
+
+export interface SentChallenge {
+  readonly id: string;
+  readonly sealed_nonce: string;
+  readonly expires_at: number;
 }
 
 const NOT_FOUND = { error: "not found" };
@@ -89,16 +122,19 @@ const INVALID = { error: "invalid request" };
 
 export function fakeRotationApi(state: FakeState): FakeRotationApi {
   const calls: FakeCall[] = [];
+  let minted = 0;
   const api: FakeRotationApi = {
     state,
     calls,
     beforeCommit: undefined,
+    challenges: new Map(),
+    tamperChallenge: undefined,
     fetch: (async (input: string | URL | Request, init?: RequestInit) => {
       init?.signal?.throwIfAborted();
       const url = new URL(String(input));
       const method = init?.method ?? "GET";
       const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined;
-      const [status, response] = route(method, url.pathname, init, body);
+      const [status, response] = await route(method, url.pathname, init, body);
       calls.push({ method, path: url.pathname, body, status, response });
       return new Response(JSON.stringify(response), {
         status,
@@ -107,12 +143,12 @@ export function fakeRotationApi(state: FakeState): FakeRotationApi {
     }) as typeof globalThis.fetch,
   };
 
-  function route(
+  async function route(
     method: string,
     path: string,
     init: RequestInit | undefined,
     body: unknown,
-  ): [number, unknown] {
+  ): Promise<[number, unknown]> {
     if (new Headers(init?.headers).get("authorization") !== `Bearer ${FAKE_TOKEN}`) {
       return [401, { error: "unauthorized" }];
     }
@@ -123,7 +159,7 @@ export function fakeRotationApi(state: FakeState): FakeRotationApi {
     if (tenantId !== state.tenantId) return [404, NOT_FOUND];
     const group = state.groups.find((g) => g.id === groupId && g.tenantId === tenantId);
     if (group === undefined) return [404, NOT_FOUND];
-    if (method === "GET") return [200, material(group)];
+    if (method === "GET") return [200, await material(group)];
     if (method === "POST") return commit(group, body);
     return [405, { error: "method not allowed" }];
   }
@@ -141,7 +177,29 @@ export function fakeRotationApi(state: FakeState): FakeRotationApi {
     });
   }
 
-  function material(group: FakeGroup): unknown {
+  async function challengeFor(group: FakeGroup): Promise<SentChallenge> {
+    minted += 1;
+    const id = `0192f1a0-cccc-7000-8000-${minted.toString(16).padStart(12, "0")}`;
+    const nonce = globalThis.crypto.getRandomValues(new Uint8Array(32));
+    api.challenges.set(id, {
+      groupId: group.id,
+      generation: group.generation,
+      nonce: base64Encode(nonce),
+      spent: false,
+    });
+    const honest = {
+      id,
+      sealed_nonce: await seal(
+        nonce,
+        asPublicKey(base64Decode(group.publicKey)),
+        bucketAssociatedData(group.id, `rotation-challenge:${id}`),
+      ),
+      expires_at: 2_000_000_000,
+    };
+    return api.tamperChallenge === undefined ? honest : api.tamperChallenge(honest, group);
+  }
+
+  async function material(group: FakeGroup): Promise<unknown> {
     return {
       id: group.id,
       generation: group.generation,
@@ -154,6 +212,7 @@ export function fakeRotationApi(state: FakeState): FakeRotationApi {
         sealed: sealedOf(c.config),
       })),
       auth_apps: appsOf(group).map(({ app, copy }) => ({ id: app.id, sealed_client_secret: copy })),
+      challenge: await challengeFor(group),
     };
   }
 
@@ -161,6 +220,27 @@ export function fakeRotationApi(state: FakeState): FakeRotationApi {
     const body = parseCommit(raw);
     if (body === undefined) return [400, INVALID];
     api.beforeCommit?.();
+
+    if (body.challenge_id === undefined || body.challenge_nonce === undefined) {
+      return [403, { error: "proof required" }];
+    }
+    const challenge = api.challenges.get(body.challenge_id);
+    if (
+      challenge === undefined ||
+      challenge.groupId !== group.id ||
+      challenge.nonce !== body.challenge_nonce
+    ) {
+      return [403, { error: "proof invalid" }];
+    }
+    if (challenge.spent) return [409, { error: "stale" }];
+    // Another generation's challenge is a lost race when sent with its own
+    // generation (409 stale below), and no proof otherwise.
+    if (
+      challenge.generation !== group.generation &&
+      challenge.generation !== body.expected_generation
+    ) {
+      return [403, { error: "proof invalid" }];
+    }
 
     const connections = connectionsOf(group);
     const apps = appsOf(group);
@@ -190,7 +270,8 @@ export function fakeRotationApi(state: FakeState): FakeRotationApi {
     }
     if (body.public_key === group.publicKey) return [409, { error: "public key not new" }];
 
-    // One generation, all of it.
+    // One generation, all of it, and the challenge spent with it.
+    challenge.spent = true;
     group.generation += 1;
     group.publicKey = body.public_key;
     group.keys = body.keys.map((k) => {
@@ -268,6 +349,8 @@ interface SentCommit {
   auth_apps: SentApp[];
   recovery_public_key?: string;
   recovery_entry?: string;
+  challenge_id?: string;
+  challenge_nonce?: string;
 }
 
 const isRecord = (v: unknown): v is Record<string, unknown> =>
@@ -289,7 +372,11 @@ function parseCommit(raw: unknown): SentCommit | undefined {
       "auth_apps",
       "recovery_public_key",
       "recovery_entry",
+      "challenge_id",
+      "challenge_nonce",
     ]) ||
+    (raw["challenge_id"] !== undefined && typeof raw["challenge_id"] !== "string") ||
+    (raw["challenge_nonce"] !== undefined && typeof raw["challenge_nonce"] !== "string") ||
     !isInt(raw["expected_generation"], 0) ||
     typeof raw["public_key"] !== "string" ||
     !PUBLIC_KEY.test(raw["public_key"]) ||

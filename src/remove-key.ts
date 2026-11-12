@@ -6,6 +6,7 @@
  *     refuse the last key            before any request
  *     fetch-group                    GET  /tenants/{t}/key-groups/{g}/rotation
  *     unwrap old K1                  with a surviving key
+ *     open the challenge             with the old K1: proof of possession
  *     rotateGroup                    new K1, every field resealed, bucket rebuilt,
  *                                    K1 sealed to the caller's K0 when given one
  *     commit-rotation                POST /tenants/{t}/key-groups/{g}/rotation
@@ -22,6 +23,13 @@
  * that does is refused unless the caller presents K0 itself, from a source it
  * trusts.
  *
+ * **The commit proves possession of the current K1.** A user session alone
+ * cannot rotate a group: fetch-group seals a fresh 32-byte nonce to the current
+ * public half, and the commit sends it back opened. The challenge is opened
+ * under associated data the SDK builds itself, from the group it asked for, so
+ * a server cannot pass off a connection's field as a challenge and read its
+ * plaintext in the reply; and only an exactly 32-byte nonce is ever sent.
+ *
  * **"stale" is retried, nothing else is.** A `409 stale` means a field, an app
  * copy or the generation moved between fetch and commit, and nothing was
  * written; the whole rotation is redone from a fresh fetch, up to `maxAttempts`.
@@ -35,7 +43,7 @@ import type { RegisteredKeyGroup } from "./bootstrap.js";
 import { KeyGroupRegistrarError } from "./bootstrap.js";
 import { parseUuid } from "./bundle/layout.js";
 import { base64Decode, base64Encode, timingSafeEqual } from "./encoding.js";
-import { derivePublicKey } from "./envelope.js";
+import { bucketAssociatedData, derivePublicKey, open } from "./envelope.js";
 import { findBucketEntry, rotateGroup, unwrap } from "./group.js";
 import {
   type ApiKeyBytes,
@@ -74,6 +82,16 @@ export interface RotationMaterial {
   }[];
   /** Only the apps holding a copy for this group, and only that copy. */
   readonly auth_apps: readonly { readonly id: string; readonly sealed_client_secret: string }[];
+  /**
+   * Proof of possession: 32 random bytes sealed to `public_key` under
+   * `bucketAssociatedData(group id, "rotation-challenge:" + id)`. Single use,
+   * valid until `expires_at` (unix seconds, exclusive).
+   */
+  readonly challenge: {
+    readonly id: string;
+    readonly sealed_nonce: string;
+    readonly expires_at: number;
+  };
 }
 
 /** The body of `POST /tenants/{tenantId}/key-groups/{groupId}/rotation` (`CommitRotation`). */
@@ -94,11 +112,18 @@ export interface CommitRotationRequest {
   }[];
   readonly recovery_public_key?: string;
   readonly recovery_entry?: SealedEnvelope;
+  /** `challenge.id` from the fetch this body was built from. */
+  readonly challenge_id: string;
+  /** The challenge's nonce opened with the current K1: base64 of 32 bytes. */
+  readonly challenge_nonce: string;
 }
 
 export interface KeyGroupRotator {
   fetchRotation(tenantId: string, groupId: string, signal?: AbortSignal): Promise<RotationMaterial>;
-  /** Throws a `KeyGroupRegistrarError` for any non-200; `409` carries the API's reason. */
+  /**
+   * Throws a `KeyGroupRegistrarError` for any non-200; `403` (the proof was
+   * refused) and `409` carry the API's reason.
+   */
   commitRotation(
     tenantId: string,
     groupId: string,
@@ -122,7 +147,8 @@ export interface KeyGroupRotator {
  * - `unknown-survivor` — a surviving key is not in the bucket. Rotation never
  *   adds a key; that is add-key.
  * - `inconsistent-material` — the fetched group does not hang together: its
- *   public half is not what the bucket unwraps to, or an id is malformed.
+ *   public half is not what the bucket unwraps to, an id is malformed, or its
+ *   challenge does not open under the current K1 to exactly 32 bytes.
  * - `recovery-key-required` — the API says the group has a recovery key (K0)
  *   and the caller did not present one. The new K1 is never sealed to a K0 the
  *   API supplied: a substituted one would hand the attacker the group.
@@ -205,6 +231,8 @@ const DEFAULT_MAX_ATTEMPTS = 3;
 const TAGGED_ID = /^[a-z]{4}-(.{36})$/;
 /** The field name an app's client secret is sealed under (adr/0033 D16). */
 const CLIENT_SECRET_FIELD = "client-secret";
+/** The challenge's nonce: what the commit sends back opened, and nothing else. */
+const CHALLENGE_NONCE_BYTES = 32;
 
 /**
  * Remove one API key from a key group: fetch, unwrap with a surviving key,
@@ -214,9 +242,10 @@ const CLIENT_SECRET_FIELD = "client-secret";
  *   or one that is also the key being removed, or a `maxAttempts` that is not
  *   an integer >= 1 — before any request.
  * @throws {KeyRemovalRefusedError} before the commit; see its reasons.
- * @throws {KeyGroupRegistrarError} for a refusal by the API: `404` not this
- *   tenant's group, `409` with the API's reason (a `stale` one only after
- *   `maxAttempts` rounds).
+ * @throws {KeyGroupRegistrarError} for a refusal by the API: `403` the proof
+ *   of possession was refused (`proof required` / `proof invalid`, e.g. the
+ *   challenge expired), `404` not this tenant's group, `409` with the API's
+ *   reason (a `stale` one only after `maxAttempts` rounds).
  * @throws {VaultDecryptionError} when the surviving key does not open its entry
  *   or a stored field does not open under the old K1. Nothing was committed.
  * @throws {KeyRemovalOutcomeUnknownError} when the commit's 200 names a group
@@ -340,6 +369,7 @@ async function rotation(
         "the group's public half is not the one its bucket unwraps to",
       );
     }
+    const challengeNonce = await answer(material.challenge, oldPrivateKey, oldPublicKey, groupId);
     const rotated = await rotateGroup(
       oldPrivateKey,
       fields.map((f) => f.field),
@@ -385,11 +415,51 @@ async function rotation(
             recovery_public_key: base64Encode(k0 as PublicKey),
             recovery_entry: rotated.recovery,
           }),
+      challenge_id: material.challenge.id,
+      challenge_nonce: challengeNonce,
     };
   } finally {
     oldPrivateKey?.fill(0);
     newPrivateKey?.fill(0);
   }
+}
+
+/**
+ * Open fetch-group's challenge with the current K1 and return the nonce, base64.
+ *
+ * The associated data is built here, from the group the caller named, so the
+ * only envelopes that open are ones sealed AS a challenge for this group: a
+ * connection's field or an app's secret binds 16 uuid bytes first and fails
+ * the tag. Anything that does not open to exactly 32 bytes is refused, and
+ * nothing is sent.
+ */
+async function answer(
+  challenge: RotationMaterial["challenge"],
+  privateKey: PrivateKey,
+  publicKey: PublicKey,
+  groupId: string,
+): Promise<string> {
+  let nonce: Uint8Array;
+  try {
+    nonce = await open(
+      challenge.sealed_nonce,
+      privateKey,
+      bucketAssociatedData(groupId, `rotation-challenge:${challenge.id}`),
+      publicKey,
+    );
+  } catch {
+    throw new KeyRemovalRefusedError(
+      "inconsistent-material",
+      "the rotation challenge does not open under the group's current key",
+    );
+  }
+  if (nonce.byteLength !== CHALLENGE_NONCE_BYTES) {
+    throw new KeyRemovalRefusedError(
+      "inconsistent-material",
+      `the rotation challenge is ${nonce.byteLength} bytes, not ${CHALLENGE_NONCE_BYTES}`,
+    );
+  }
+  return base64Encode(nonce);
 }
 
 interface LocatedField {
