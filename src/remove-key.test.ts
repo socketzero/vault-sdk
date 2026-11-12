@@ -691,8 +691,12 @@ describe("removeKey", () => {
 
     it("propagates the API's 403 without retrying, and nothing lands", async () => {
       const w = await world(2, false);
-      // The challenge is gone by the time the commit is judged.
-      w.api.beforeCommit = () => w.api.challenges.clear();
+      // The server keys the proof by another nonce than the one it sealed.
+      w.api.beforeCommit = () => {
+        for (const [id, c] of w.api.challenges) {
+          w.api.challenges.set(id, { ...c, nonce: base64Encode(new Uint8Array(32).fill(9)) });
+        }
+      };
       const err = await run(w);
       expect(err).toBeInstanceOf(KeyGroupRegistrarError);
       expect((err as KeyGroupRegistrarError).status).toBe(403);
@@ -778,21 +782,56 @@ describe("removeKey", () => {
       expect(w.group.publicKey).toBe(base64Encode(w.k1.publicKey));
     });
 
-    it("gets the API's 403 for a challenge that expired before the commit, and does not retry", async () => {
+    it("fetches again when the challenge expired before the commit (409 stale), and lands", async () => {
       const w = await world(2, false);
-      // A reseal slower than the challenge's 300 s life.
+      // The first reseal is slower than the challenge's 300 s life.
+      let slow = true;
       w.api.beforeCommit = () => {
-        w.api.now += 300;
+        if (slow) w.api.now += 300;
+        slow = false;
       };
-      const err = await run(w);
-      expect(err).toBeInstanceOf(KeyGroupRegistrarError);
-      expect((err as KeyGroupRegistrarError).status).toBe(403);
-      expect((err as KeyGroupRegistrarError).apiError).toBe("proof invalid");
+      await expect(run(w)).resolves.toMatchObject({ removedKeyId: w.keyIds[1] });
       expect(w.api.calls.map((x) => [x.method, x.status])).toEqual([
         ["GET", 200],
-        ["POST", 403],
+        ["POST", 409],
+        ["GET", 200],
+        ["POST", 200],
       ]);
-      expect(w.group.generation).toBe(4);
+      expect(w.group.generation).toBe(5);
+    });
+
+    // socket0-api#42 review, round 4: a group holds eight unspent challenges
+    // and a ninth fetch evicts the oldest. A stolen session fetching eight
+    // times between this client's fetch and commit must not fail the removal.
+    it("fetches again when other fetches evicted its challenge before the commit, and lands", async () => {
+      const w = await world(2, false);
+      const real = rotator(w.api);
+      let evict = true;
+      const crowded: KeyGroupRotator = {
+        fetchRotation: real.fetchRotation.bind(real),
+        commitRotation: async (...args) => {
+          if (evict) {
+            evict = false;
+            for (let i = 0; i < 8; i += 1) await real.fetchRotation(TENANT, GROUP_ID);
+          }
+          return real.commitRotation(...args);
+        },
+      };
+      const removed = await removeKey({
+        rotator: crowded,
+        tenantId: TENANT,
+        groupId: GROUP_ID,
+        keyId: w.keyIds[1] as string,
+        survivingKeys: [(w.keys[0] as ApiKeyMaterial).bytes],
+      });
+      expect(removed.removedKeyId).toBe(w.keyIds[1]);
+      expect(w.api.calls.map((x) => [x.method, x.status])).toEqual([
+        ...Array.from({ length: 9 }, () => ["GET", 200]),
+        ["POST", 409],
+        ["GET", 200],
+        ["POST", 200],
+      ]);
+      expect(w.group.generation).toBe(5);
     });
 
     it("lands with a challenge one second short of expiry", async () => {

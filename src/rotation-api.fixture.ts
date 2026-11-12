@@ -21,11 +21,13 @@
  *     must carry `challenge_id` and `challenge_proof` — HMAC-SHA256 keyed by
  *     the nonce over "socket0/rotation-proof/v1" 0x00 group id 0x00 and the
  *     body without the proof, keys sorted — so a proof answers for one body
- *     only: absent is `403 proof required`; wrong (for that body), another
- *     group's, expired
- *     (`expires_at`, 300 s after minting on `now`, is exclusive), or an
- *     earlier generation's sent with a generation other than its own is
- *     `403 proof invalid`; spent is `409 stale`. A landed commit spends it.
+ *     only: absent is `403 proof required`; a challenge that is not live -
+ *     unknown, another group's, spent, expired (`expires_at`, 300 s after
+ *     minting on `now`, is exclusive) or evicted (a group holds at most eight
+ *     unspent; a ninth fetch evicts the oldest) - is `409 stale`, its proof
+ *     unchecked; wrong (for that body), or an earlier generation's sent with
+ *     a generation other than its own, is `403 proof invalid`. A landed commit
+ *     spends it.
  *
  * The only cryptography here is that `seal`, which needs no secret, and the
  * proof's HMAC, keyed by a nonce the server minted. The server cannot open
@@ -129,6 +131,8 @@ export interface SentChallenge {
 const NOT_FOUND = { error: "not found" };
 /** socket0-api's challenge life, seconds. */
 const CHALLENGE_TTL = 300;
+/** socket0-api's `LIVE_CHALLENGES_PER_GROUP`. */
+const LIVE_CHALLENGES_PER_GROUP = 8;
 const INVALID = { error: "invalid request" };
 
 export function fakeRotationApi(state: FakeState): FakeRotationApi {
@@ -194,6 +198,11 @@ export function fakeRotationApi(state: FakeState): FakeRotationApi {
     const id = `0192f1a0-cccc-7000-8000-${minted.toString(16).padStart(12, "0")}`;
     const nonce = globalThis.crypto.getRandomValues(new Uint8Array(32));
     const expiresAt = api.now + CHALLENGE_TTL;
+    // The cap: keep the group's newest seven unspent, then add this one.
+    const live = [...api.challenges].filter(([, c]) => c.groupId === group.id && !c.spent);
+    for (const [old] of live.slice(0, Math.max(0, live.length - (LIVE_CHALLENGES_PER_GROUP - 1)))) {
+      api.challenges.delete(old);
+    }
     api.challenges.set(id, {
       groupId: group.id,
       generation: group.generation,
@@ -242,12 +251,14 @@ export function fakeRotationApi(state: FakeState): FakeRotationApi {
     if (
       challenge === undefined ||
       challenge.groupId !== group.id ||
-      (await expectedProof(challenge.nonce, group.id, raw)) !== body.challenge_proof
+      challenge.spent ||
+      challenge.expiresAt <= api.now
     ) {
+      return [409, { error: "stale" }];
+    }
+    if ((await expectedProof(challenge.nonce, group.id, raw)) !== body.challenge_proof) {
       return [403, { error: "proof invalid" }];
     }
-    if (challenge.spent) return [409, { error: "stale" }];
-    if (challenge.expiresAt <= api.now) return [403, { error: "proof invalid" }];
     // Another generation's challenge is a lost race when sent with its own
     // generation (409 stale below), and no proof otherwise.
     if (

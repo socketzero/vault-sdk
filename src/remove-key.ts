@@ -250,9 +250,10 @@ const PROOF_DOMAIN = "socket0/rotation-proof/v1";
  *   an integer >= 1 — before any request.
  * @throws {KeyRemovalRefusedError} before the commit; see its reasons.
  * @throws {KeyGroupRegistrarError} for a refusal by the API: `403` the proof
- *   of possession was refused (`proof required` / `proof invalid`, e.g. the
- *   challenge expired), `404` not this tenant's group, `409` with the API's
- *   reason (a `stale` one only after `maxAttempts` rounds).
+ *   of possession was refused (`proof required` / `proof invalid`), `404` not
+ *   this tenant's group, `409` with the API's reason (a `stale` one - which
+ *   includes a challenge that expired or was evicted before the commit - only
+ *   after `maxAttempts` rounds).
  * @throws {VaultDecryptionError} when the surviving key does not open its entry
  *   or a stored field does not open under the old K1. Nothing was committed.
  * @throws {KeyRemovalOutcomeUnknownError} when the commit's 200 names a group
