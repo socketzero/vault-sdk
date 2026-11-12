@@ -207,7 +207,11 @@ export type {
   RemoveKeyOptions,
   RotationMaterial,
 } from "./remove-key.js";
-export { KeyRemovalRefusedError, removeKey } from "./remove-key.js";
+export {
+  KeyRemovalOutcomeUnknownError,
+  KeyRemovalRefusedError,
+  removeKey,
+} from "./remove-key.js";
 // --- branded key material: the only way to make a key out of bytes ---------
 //
 // A public half, a private half and an API key are all 32 raw bytes and all

@@ -7,7 +7,7 @@
  *     fetch-group                    GET  /tenants/{t}/key-groups/{g}/rotation
  *     unwrap old K1                  with a surviving key
  *     rotateGroup                    new K1, every field resealed, bucket rebuilt,
- *                                    K1 sealed to K0 when the group has one
+ *                                    K1 sealed to the caller's K0 when given one
  *     commit-rotation                POST /tenants/{t}/key-groups/{g}/rotation
  *
  * **Every surviving key is presented.** The new bucket wraps the new K1 under
@@ -15,6 +15,12 @@
  * else can produce it. So the caller names the key that goes by its id (the
  * holder may be gone) and hands in the raw bytes of every key that stays. A
  * bucket key that is in neither list is refused rather than silently revoked.
+ *
+ * **K0 comes from the caller, never from the API.** The new K1 private half is
+ * sealed to K0's public half, so whoever names that key can read the group. The
+ * fetched `recovery_public_key` only tells whether the group has one; a group
+ * that does is refused unless the caller presents K0 itself, from a source it
+ * trusts.
  *
  * **"stale" is retried, nothing else is.** A `409 stale` means a field, an app
  * copy or the generation moved between fetch and commit, and nothing was
@@ -117,13 +123,17 @@ export interface KeyGroupRotator {
  *   adds a key; that is add-key.
  * - `inconsistent-material` — the fetched group does not hang together: its
  *   public half is not what the bucket unwraps to, or an id is malformed.
+ * - `recovery-key-required` — the API says the group has a recovery key (K0)
+ *   and the caller did not present one. The new K1 is never sealed to a K0 the
+ *   API supplied: a substituted one would hand the attacker the group.
  */
 export type KeyRemovalRefusal =
   | "last-key"
   | "not-in-group"
   | "unlisted-key"
   | "unknown-survivor"
-  | "inconsistent-material";
+  | "inconsistent-material"
+  | "recovery-key-required";
 
 export class KeyRemovalRefusedError extends VaultError {
   readonly reason: KeyRemovalRefusal;
@@ -131,6 +141,27 @@ export class KeyRemovalRefusedError extends VaultError {
     super(message);
     this.name = "KeyRemovalRefusedError";
     this.reason = reason;
+  }
+}
+
+/**
+ * The commit answered 200, but the group it returned is not the one committed:
+ * a public half other than the new one, a generation other than expected + 1,
+ * or a bucket that is not exactly the surviving keys. The rotation may or may
+ * not have landed; fetch the group and compare `publicKey` before retrying.
+ */
+export class KeyRemovalOutcomeUnknownError extends VaultError {
+  readonly removedKeyId: string;
+  /** The new K1 public half, base64, as committed. */
+  readonly publicKey: string;
+  /** What the API returned. */
+  readonly group: RegisteredKeyGroup;
+  constructor(removedKeyId: string, publicKey: string, group: RegisteredKeyGroup, why: string) {
+    super(`removing key ${removedKeyId} may not have landed: the commit answered ${why}`);
+    this.name = "KeyRemovalOutcomeUnknownError";
+    this.removedKeyId = removedKeyId;
+    this.publicKey = publicKey;
+    this.group = group;
   }
 }
 
@@ -148,17 +179,22 @@ export interface RemoveKeyOptions {
   /** The raw bytes of EVERY key that stays. The first one unwraps the old K1. */
   readonly survivingKeys: readonly ApiKeyBytes[];
   /**
-   * A new K0 public half, replacing the group's. Omitted, the group's current
-   * K0 (as fetched) is kept, and a group without one stays without one.
+   * K0's public half, from a source the caller trusts — never read back from
+   * the API. The new K1 is sealed to it: the group's current K0 keeps it, a new
+   * one replaces it. Required when the group has a K0 (refused otherwise, as
+   * `recovery-key-required`); omitted for a group without one, which stays so.
    */
   readonly recoveryPublicKey?: PublicKey;
-  /** How many fetch-and-commit rounds a run of `409 stale` may take. Default 3. */
+  /** How many fetch-and-commit rounds a run of `409 stale` may take: an integer >= 1. Default 3. */
   readonly maxAttempts?: number;
   readonly signal?: AbortSignal;
 }
 
 export interface RemovedKey {
-  /** The group as committed: generation incremented, the new public half. */
+  /**
+   * The group as committed, checked: the new public half, generation
+   * incremented, exactly the surviving keys.
+   */
   readonly group: RegisteredKeyGroup;
   readonly removedKeyId: string;
 }
@@ -172,16 +208,19 @@ const CLIENT_SECRET_FIELD = "client-secret";
 
 /**
  * Remove one API key from a key group: fetch, unwrap with a surviving key,
- * rotate (with K0 when the group has one), commit — as one generation.
+ * rotate (sealed to the caller's K0 when given one), commit — as one generation.
  *
  * @throws {RangeError} for a malformed `keyId`, a surviving key presented twice
- *   or one that is also the key being removed — before any request.
+ *   or one that is also the key being removed, or a `maxAttempts` that is not
+ *   an integer >= 1 — before any request.
  * @throws {KeyRemovalRefusedError} before the commit; see its reasons.
  * @throws {KeyGroupRegistrarError} for a refusal by the API: `404` not this
  *   tenant's group, `409` with the API's reason (a `stale` one only after
  *   `maxAttempts` rounds).
  * @throws {VaultDecryptionError} when the surviving key does not open its entry
  *   or a stored field does not open under the old K1. Nothing was committed.
+ * @throws {KeyRemovalOutcomeUnknownError} when the commit's 200 names a group
+ *   other than the one committed.
  */
 export async function removeKey(options: RemoveKeyOptions): Promise<RemovedKey> {
   const { rotator, tenantId, groupId, keyId, survivingKeys, signal } = options;
@@ -194,27 +233,50 @@ export async function removeKey(options: RemoveKeyOptions): Promise<RemovedKey> 
       "removing the last key would leave a group nothing can ever open; reset or delete the group instead",
     );
   }
+  const maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
+  if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1) {
+    throw new RangeError(`maxAttempts is an integer >= 1, got ${maxAttempts}`);
+  }
   const survivorIds = await Promise.all(survivingKeys.map((k) => deriveKeyIdHex(k, tenantId)));
   if (new Set(survivorIds).size !== survivorIds.length || survivorIds.includes(keyId)) {
     throw new RangeError("each surviving key is presented once, and not the key being removed");
   }
 
-  const maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
   for (let attempt = 1; ; attempt += 1) {
     signal?.throwIfAborted();
     const material = await rotator.fetchRotation(tenantId, groupId, signal);
     const body = await rotation(material, options, survivorIds);
+    let group: RegisteredKeyGroup;
     try {
-      const group = await rotator.commitRotation(tenantId, groupId, body, signal);
-      return { group, removedKeyId: keyId };
+      group = await rotator.commitRotation(tenantId, groupId, body, signal);
     } catch (error) {
       const stale =
         error instanceof KeyGroupRegistrarError &&
         error.status === 409 &&
         error.apiError === "stale";
       if (!stale || attempt >= maxAttempts) throw error;
+      continue;
     }
+    const why = mismatch(group, body);
+    if (why !== undefined) {
+      throw new KeyRemovalOutcomeUnknownError(keyId, body.public_key, group, why);
+    }
+    return { group, removedKeyId: keyId };
   }
+}
+
+/** Why the commit's answer is not the group just committed, or undefined when it is. */
+function mismatch(group: RegisteredKeyGroup, body: CommitRotationRequest): string | undefined {
+  if (group.public_key !== body.public_key) return "another public half";
+  if (group.generation !== body.expected_generation + 1) {
+    return `generation ${group.generation}, not ${body.expected_generation + 1}`;
+  }
+  const committed = body.keys.map((k) => k.key_id).sort();
+  const returned = group.keys.map((k) => k.key_id).sort();
+  if (committed.length !== returned.length || committed.some((id, i) => id !== returned[i])) {
+    return "a bucket other than the surviving keys";
+  }
+  return undefined;
 }
 
 /** Check the fetched material against the request and build the commit body. */
@@ -247,6 +309,15 @@ async function rotation(
       `keys ${unlisted.join(", ")} would be revoked silently; present them to keep them`,
     );
   }
+  // The fetched K0 is only a hint that the group has one; sealing the new K1 to
+  // it would let whoever wrote it read the group.
+  const k0 = options.recoveryPublicKey;
+  if (k0 === undefined && material.recovery_public_key !== null) {
+    throw new KeyRemovalRefusedError(
+      "recovery-key-required",
+      "the group has a recovery key; present its public half (recoveryPublicKey) from a source you trust",
+    );
+  }
 
   const fields = fieldsOf(material);
   const oldPublicKey = asPublicKey(base64Decode(material.public_key));
@@ -269,11 +340,6 @@ async function rotation(
         "the group's public half is not the one its bucket unwraps to",
       );
     }
-    const k0 =
-      options.recoveryPublicKey ??
-      (material.recovery_public_key === null
-        ? undefined
-        : asPublicKey(base64Decode(material.recovery_public_key)));
     const rotated = await rotateGroup(
       oldPrivateKey,
       fields.map((f) => f.field),

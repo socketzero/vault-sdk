@@ -18,7 +18,12 @@ import { fieldAssociatedData, open, seal } from "./envelope.js";
 import { buildBucket, findBucketEntry, generateGroup, unwrap } from "./group.js";
 import { openRecovery, sealRecovery } from "./recovery.js";
 import { httpKeyGroupRotator } from "./registrar-http.js";
-import { KeyRemovalRefusedError, removeKey } from "./remove-key.js";
+import {
+  type KeyGroupRotator,
+  KeyRemovalOutcomeUnknownError,
+  KeyRemovalRefusedError,
+  removeKey,
+} from "./remove-key.js";
 import {
   FAKE_BASE_URL,
   FAKE_TOKEN,
@@ -157,6 +162,8 @@ async function world(keyCount: number, recovery: boolean): Promise<World> {
   return { api, k1, k0, keys, keyIds, group };
 }
 
+type Committed = Awaited<ReturnType<KeyGroupRotator["commitRotation"]>>;
+
 function rotator(api: FakeRotationApi) {
   return httpKeyGroupRotator({ baseUrl: FAKE_BASE_URL, accessToken: FAKE_TOKEN, fetch: api.fetch });
 }
@@ -202,6 +209,7 @@ describe("removeKey", () => {
       groupId: GROUP_ID,
       keyId: w.keyIds[2] as string,
       survivingKeys: [a.bytes, b.bytes],
+      recoveryPublicKey: (w.k0 as GroupKeyPair).publicKey,
     });
 
     expect(result.removedKeyId).toBe(w.keyIds[2]);
@@ -452,7 +460,7 @@ describe("removeKey", () => {
     expect(w.api.calls.filter((x) => x.method === "POST")).toHaveLength(2);
   });
 
-  it("does not retry a 409 that is not stale", async () => {
+  it("does not retry a 409 that is not stale (K0 appeared after the fetch)", async () => {
     const w = await world(2, false);
     w.api.beforeCommit = () => {
       w.group.recoveryPublicKey = base64Encode(new Uint8Array(32).fill(9));
@@ -526,4 +534,127 @@ describe("removeKey", () => {
     ).rejects.toThrow("stop");
     expect(w.api.calls).toHaveLength(0);
   });
+
+  describe("trust boundary: what the API returns is checked, never trusted", () => {
+    it("refuses to keep a K0 it was not given, so K1 is never sealed to a server-supplied key", async () => {
+      const w = await world(2, true);
+      const attacker = await generateGroup();
+      w.group.recoveryPublicKey = base64Encode(attacker.publicKey);
+      const err = await removeKey({
+        rotator: rotator(w.api),
+        tenantId: TENANT,
+        groupId: GROUP_ID,
+        keyId: w.keyIds[1] as string,
+        survivingKeys: [(w.keys[0] as ApiKeyMaterial).bytes],
+      }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(KeyRemovalRefusedError);
+      expect((err as KeyRemovalRefusedError).reason).toBe("recovery-key-required");
+      expect(w.api.calls.map((x) => x.method)).toEqual(["GET"]);
+      expect(w.group.generation).toBe(4);
+    });
+
+    it("refuses a K0 that newly appears in the fetch of a group the caller holds without one", async () => {
+      const w = await world(2, false);
+      w.group.recoveryPublicKey = base64Encode((await generateGroup()).publicKey);
+      const err = await removeKey({
+        rotator: rotator(w.api),
+        tenantId: TENANT,
+        groupId: GROUP_ID,
+        keyId: w.keyIds[1] as string,
+        survivingKeys: [(w.keys[0] as ApiKeyMaterial).bytes],
+      }).catch((e: unknown) => e);
+      expect((err as KeyRemovalRefusedError).reason).toBe("recovery-key-required");
+      expect(w.api.calls.map((x) => x.method)).toEqual(["GET"]);
+    });
+
+    it("seals the new K1 to the caller's K0 even when the fetch names another one", async () => {
+      const w = await world(2, true);
+      const attacker = await generateGroup();
+      w.group.recoveryPublicKey = base64Encode(attacker.publicKey);
+      const k0 = w.k0 as GroupKeyPair;
+      await removeKey({
+        rotator: rotator(w.api),
+        tenantId: TENANT,
+        groupId: GROUP_ID,
+        keyId: w.keyIds[1] as string,
+        survivingKeys: [(w.keys[0] as ApiKeyMaterial).bytes],
+        recoveryPublicKey: k0.publicKey,
+      });
+      const k1Public = asPublicKey(base64Decode(w.group.publicKey));
+      expect(w.group.recoveryPublicKey).toBe(base64Encode(k0.publicKey));
+      await expect(
+        openRecovery(w.group.recoveryEntry as string, k0.privateKey, GROUP_ID, k1Public),
+      ).resolves.toHaveLength(32);
+      await expect(
+        openRecovery(w.group.recoveryEntry as string, attacker.privateKey, GROUP_ID, k1Public),
+      ).rejects.toBeInstanceOf(VaultDecryptionError);
+    });
+
+    it("fails with nothing committed when the holder's fetched bucket entry does not open", async () => {
+      const w = await world(2, false);
+      const entry = w.group.keys[0] as (typeof w.group.keys)[number];
+      const bytes = base64Decode(entry.wrapped);
+      bytes[bytes.length - 1] = (bytes[bytes.length - 1] as number) ^ 1;
+      entry.wrapped = base64Encode(bytes);
+      const err = await removeKey({
+        rotator: rotator(w.api),
+        tenantId: TENANT,
+        groupId: GROUP_ID,
+        keyId: w.keyIds[1] as string,
+        survivingKeys: [(w.keys[0] as ApiKeyMaterial).bytes],
+      }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(VaultDecryptionError);
+      expect(w.api.calls.map((x) => x.method)).toEqual(["GET"]);
+      expect(w.group.generation).toBe(4);
+    });
+
+    it.each([
+      [
+        "the pre-rotation public half",
+        (g: Committed, w: World) => ({ ...g, public_key: base64Encode(w.k1.publicKey) }),
+      ],
+      ["an unmoved generation", (g: Committed) => ({ ...g, generation: g.generation - 1 })],
+      [
+        "the removed key still listed",
+        (g: Committed, w: World) => ({
+          ...g,
+          keys: [...g.keys, { key_id: w.keyIds[1] as string, label: null, created_at: 101 }],
+        }),
+      ],
+    ])("does not report success for a commit 200 naming %s", async (_what, lie) => {
+      const w = await world(2, false);
+      const real = rotator(w.api);
+      const lying: KeyGroupRotator = {
+        fetchRotation: real.fetchRotation.bind(real),
+        commitRotation: async (...args) => lie(await real.commitRotation(...args), w) as Committed,
+      };
+      const err = await removeKey({
+        rotator: lying,
+        tenantId: TENANT,
+        groupId: GROUP_ID,
+        keyId: w.keyIds[1] as string,
+        survivingKeys: [(w.keys[0] as ApiKeyMaterial).bytes],
+      }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(KeyRemovalOutcomeUnknownError);
+      expect((err as KeyRemovalOutcomeUnknownError).removedKeyId).toBe(w.keyIds[1]);
+      expect((err as KeyRemovalOutcomeUnknownError).publicKey).toBe(w.group.publicKey);
+    });
+  });
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, 0, -1, 1.5])(
+    "refuses maxAttempts %s before any request",
+    async (maxAttempts) => {
+      const w = await world(2, false);
+      const err = removeKey({
+        rotator: rotator(w.api),
+        tenantId: TENANT,
+        groupId: GROUP_ID,
+        keyId: w.keyIds[1] as string,
+        survivingKeys: [(w.keys[0] as ApiKeyMaterial).bytes],
+        maxAttempts,
+      });
+      await expect(err).rejects.toThrow(RangeError);
+      expect(w.api.calls).toHaveLength(0);
+    },
+  );
 });
