@@ -23,6 +23,7 @@ import {
   KeyRemovalOutcomeUnknownError,
   KeyRemovalRefusedError,
   removeKey,
+  rotationProof,
 } from "./remove-key.js";
 import {
   FAKE_BASE_URL,
@@ -38,6 +39,7 @@ import {
   type GroupKeyPair,
   type KeyGroup,
   type PublicKey,
+  type SealedEnvelope,
   VaultDecryptionError,
 } from "./types.js";
 
@@ -267,7 +269,7 @@ describe("removeKey", () => {
     expect(Object.keys(sent).sort()).toEqual([
       "auth_apps",
       "challenge_id",
-      "challenge_nonce",
+      "challenge_proof",
       "connections",
       "expected_generation",
       "keys",
@@ -275,9 +277,17 @@ describe("removeKey", () => {
       "recovery_entry",
       "recovery_public_key",
     ]);
-    // The proof: fetch-group's challenge, opened with the CURRENT K1 and sent back.
+    // The proof: fetch-group's challenge, opened with the CURRENT K1, keys an
+    // HMAC of exactly this body; the nonce itself is not sent.
     const challenge = w.api.challenges.get(sent["challenge_id"] as string);
-    expect(sent["challenge_nonce"]).toBe(challenge?.nonce);
+    const { challenge_proof, ...unproven } = sent;
+    expect(challenge_proof).toBe(
+      await rotationProof(
+        base64Decode(challenge?.nonce as string),
+        GROUP_ID,
+        unproven as unknown as Parameters<typeof rotationProof>[2],
+      ),
+    );
     expect(challenge?.spent).toBe(true);
   });
 
@@ -692,6 +702,80 @@ describe("removeKey", () => {
         ["POST", 403],
       ]);
       expect(w.group.generation).toBe(4);
+    });
+
+    it("computes the wire proof as specified (reference vector for socket0-api)", async () => {
+      // HMAC-SHA256(key = nonce, "socket0/rotation-proof/v1" 0x00 group id 0x00
+      // JCS(body without challenge_proof)), base64. Computed independently with
+      // Python's hmac + json.dumps(sort_keys=True, separators=(",", ":")).
+      const nonce = Uint8Array.from({ length: 32 }, (_, i) => i);
+      const proof = await rotationProof(nonce, GROUP_ID, {
+        expected_generation: 4,
+        public_key: `${"A".repeat(43)}=`,
+        keys: [{ key_id: "0".repeat(32), wrapped: "B".repeat(60) }],
+        connections: [
+          {
+            id: "0192a7c1-0000-7000-8000-000000000002",
+            version: 1,
+            sealed: {
+              password: "x25519-hkdf-aesgcm:AAAA" as SealedEnvelope,
+              "api-key": "x25519-hkdf-aesgcm:BBBB" as SealedEnvelope,
+            },
+          },
+        ],
+        auth_apps: [],
+        recovery_public_key: `${"C".repeat(43)}=`,
+        recovery_entry: "x25519-hkdf-aesgcm:CCCC" as SealedEnvelope,
+        challenge_id: "0192f1a0-cccc-7000-8000-000000000001",
+      });
+      expect(proof).toBe("tREhlSkaONczqDKwUGlLPMvvZErOMBV3UVyeZ/fRNiY=");
+    });
+
+    it("binds the answer to the body: a commit seen in transit cannot name another K1", async () => {
+      const w = await world(2, false);
+      // A proxy logs the commit body, then the connection drops before the
+      // server judges it: the challenge is still unspent.
+      const logged: string[] = [];
+      const honestFetch = w.api.fetch;
+      const dropping = (async (input: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          logged.push(init.body as string);
+          throw new TypeError("network dropped");
+        }
+        return honestFetch(input, init);
+      }) as typeof globalThis.fetch;
+      const err = await removeKey({
+        rotator: httpKeyGroupRotator({
+          baseUrl: FAKE_BASE_URL,
+          accessToken: FAKE_TOKEN,
+          fetch: dropping,
+        }),
+        tenantId: TENANT,
+        groupId: GROUP_ID,
+        keyId: w.keyIds[1] as string,
+        survivingKeys: [(w.keys[0] as ApiKeyMaterial).bytes],
+      }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(TypeError);
+      expect(logged).toHaveLength(1);
+      const seen = JSON.parse(logged[0] as string) as Record<string, unknown>;
+      const minted = w.api.challenges.get(seen["challenge_id"] as string);
+      // The opened nonce itself never leaves the SDK.
+      expect(logged[0]).not.toContain(minted?.nonce as string);
+
+      // A stolen session replays the proof with its own K1.
+      const attacker = await generateGroup();
+      const forged = await w.api.fetch(
+        `${FAKE_BASE_URL}/tenants/${TENANT}/key-groups/${GROUP_ID}/rotation`,
+        {
+          method: "POST",
+          headers: { authorization: `Bearer ${FAKE_TOKEN}`, "content-type": "application/json" },
+          body: JSON.stringify({ ...seen, public_key: base64Encode(attacker.publicKey) }),
+        },
+      );
+      expect(forged.status).toBe(403);
+      expect(await forged.json()).toEqual({ error: "proof invalid" });
+      expect(w.group.generation).toBe(4);
+      expect(w.group.publicKey).toBe(base64Encode(w.k1.publicKey));
     });
 
     it("gets the API's 403 for a challenge that expired before the commit, and does not retry", async () => {

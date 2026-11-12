@@ -25,10 +25,12 @@
  *
  * **The commit proves possession of the current K1.** A user session alone
  * cannot rotate a group: fetch-group seals a fresh 32-byte nonce to the current
- * public half, and the commit sends it back opened. The challenge is opened
- * under associated data the SDK builds itself, from the group it asked for, so
- * a server cannot pass off a connection's field as a challenge and read its
- * plaintext in the reply; and only an exactly 32-byte nonce is ever sent.
+ * public half, and the commit carries an HMAC of its own body keyed by the
+ * opened nonce (`rotationProof`). The nonce itself is never sent, so a body
+ * seen in transit or in a log proves nothing about any other body: it cannot
+ * name another K1. The challenge is opened under associated data the SDK
+ * builds itself, from the group it asked for, so a server cannot pass off a
+ * connection's field as a challenge; and only an exactly 32-byte nonce is used.
  *
  * **"stale" is retried, nothing else is.** A `409 stale` means a field, an app
  * copy or the generation moved between fetch and commit, and nothing was
@@ -42,7 +44,7 @@ import { deriveKeyIdHex } from "./api-key.js";
 import type { RegisteredKeyGroup } from "./bootstrap.js";
 import { KeyGroupRegistrarError } from "./bootstrap.js";
 import { parseUuid } from "./bundle/layout.js";
-import { base64Decode, base64Encode, timingSafeEqual } from "./encoding.js";
+import { base64Decode, base64Encode, timingSafeEqual, utf8Encode } from "./encoding.js";
 import { bucketAssociatedData, derivePublicKey, open } from "./envelope.js";
 import { findBucketEntry, rotateGroup, unwrap } from "./group.js";
 import {
@@ -114,8 +116,11 @@ export interface CommitRotationRequest {
   readonly recovery_entry?: SealedEnvelope;
   /** `challenge.id` from the fetch this body was built from. */
   readonly challenge_id: string;
-  /** The challenge's nonce opened with the current K1: base64 of 32 bytes. */
-  readonly challenge_nonce: string;
+  /**
+   * `rotationProof(nonce, groupId, every other field of this body)`: base64 of
+   * an HMAC-SHA256 keyed by the challenge's opened nonce. Never the nonce.
+   */
+  readonly challenge_proof: string;
 }
 
 export interface KeyGroupRotator {
@@ -233,6 +238,8 @@ const TAGGED_ID = /^[a-z]{4}-(.{36})$/;
 const CLIENT_SECRET_FIELD = "client-secret";
 /** The challenge's nonce: what the commit sends back opened, and nothing else. */
 const CHALLENGE_NONCE_BYTES = 32;
+/** Domain tag of the commit proof's MAC input. */
+const PROOF_DOMAIN = "socket0/rotation-proof/v1";
 
 /**
  * Remove one API key from a key group: fetch, unwrap with a surviving key,
@@ -361,6 +368,7 @@ async function rotation(
   const entry = await findBucketEntry(bucket, holder, tenantId);
   let oldPrivateKey: PrivateKey | undefined;
   let newPrivateKey: PrivateKey | undefined;
+  let nonce: Uint8Array | undefined;
   try {
     oldPrivateKey = await unwrap(entry as NonNullable<typeof entry>, holder, tenantId, groupId);
     if (!timingSafeEqual(await derivePublicKey(oldPrivateKey), oldPublicKey)) {
@@ -369,7 +377,7 @@ async function rotation(
         "the group's public half is not the one its bucket unwraps to",
       );
     }
-    const challengeNonce = await answer(material.challenge, oldPrivateKey, oldPublicKey, groupId);
+    nonce = await answer(material.challenge, oldPrivateKey, oldPublicKey, groupId);
     const rotated = await rotateGroup(
       oldPrivateKey,
       fields.map((f) => f.field),
@@ -402,7 +410,7 @@ async function rotation(
       }
     });
 
-    return {
+    const unproven: Omit<CommitRotationRequest, "challenge_proof"> = {
       expected_generation: material.generation,
       public_key: base64Encode(rotated.publicKey),
       keys: rotated.bucket.map((e) => ({ key_id: e.keyId, wrapped: base64Encode(e.wrapped) })),
@@ -416,16 +424,61 @@ async function rotation(
             recovery_entry: rotated.recovery,
           }),
       challenge_id: material.challenge.id,
-      challenge_nonce: challengeNonce,
     };
+    return { ...unproven, challenge_proof: await rotationProof(nonce, groupId, unproven) };
   } finally {
     oldPrivateKey?.fill(0);
     newPrivateKey?.fill(0);
+    nonce?.fill(0);
   }
 }
 
 /**
- * Open fetch-group's challenge with the current K1 and return the nonce, base64.
+ * The commit's proof of possession, bound to the body it travels in:
+ *
+ *     base64(HMAC-SHA256(key = nonce,
+ *       "socket0/rotation-proof/v1" 0x00 groupId 0x00 JCS(body)))
+ *
+ * `nonce` is the challenge opened with the current K1 (32 bytes), `body` is
+ * the commit without `challenge_proof` — `challenge_id` included — and JCS is
+ * RFC 8785; for a commit body (strings and integers only) that is
+ * `JSON.stringify` with every object's keys sorted. The server recomputes it
+ * over the body it parsed: one changed byte anywhere (a K1, a wrap, a field)
+ * and the proof does not match.
+ */
+export async function rotationProof(
+  nonce: Uint8Array,
+  groupId: string,
+  body: Omit<CommitRotationRequest, "challenge_proof">,
+): Promise<string> {
+  const subtle = globalThis.crypto.subtle;
+  const key = await subtle.importKey(
+    "raw",
+    nonce as Uint8Array<ArrayBuffer>,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const message = utf8Encode(`${PROOF_DOMAIN}\0${groupId}\0${canonicalJson(body)}`);
+  return base64Encode(new Uint8Array(await subtle.sign("HMAC", key, message)));
+}
+
+/**
+ * RFC 8785 for what a commit body holds — strings, numbers, arrays, plain
+ * objects: ES `JSON.stringify` serializes those leaves exactly as JCS does, so
+ * only the key order (UTF-16 code units, which `<` compares) is added here.
+ */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (typeof value !== "object" || value === null) return JSON.stringify(value);
+  const entries = Object.entries(value)
+    .filter(([, v]) => v !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : 1));
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(",")}}`;
+}
+
+/**
+ * Open fetch-group's challenge with the current K1 and return the nonce.
  *
  * The associated data is built here, from the group the caller named, so the
  * only envelopes that open are ones sealed AS a challenge for this group: a
@@ -438,7 +491,7 @@ async function answer(
   privateKey: PrivateKey,
   publicKey: PublicKey,
   groupId: string,
-): Promise<string> {
+): Promise<Uint8Array> {
   let nonce: Uint8Array;
   try {
     nonce = await open(
@@ -454,12 +507,13 @@ async function answer(
     );
   }
   if (nonce.byteLength !== CHALLENGE_NONCE_BYTES) {
+    nonce.fill(0);
     throw new KeyRemovalRefusedError(
       "inconsistent-material",
       `the rotation challenge is ${nonce.byteLength} bytes, not ${CHALLENGE_NONCE_BYTES}`,
     );
   }
-  return base64Encode(nonce);
+  return nonce;
 }
 
 interface LocatedField {

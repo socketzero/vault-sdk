@@ -211,6 +211,7 @@ export {
   KeyRemovalOutcomeUnknownError,
   KeyRemovalRefusedError,
   removeKey,
+  rotationProof,
 } from "./remove-key.js";
 // --- branded key material: the only way to make a key out of bytes ---------
 //

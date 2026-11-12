@@ -277,7 +277,7 @@ describe("httpKeyGroupRotator", () => {
     connections: [],
     auth_apps: [],
     challenge_id: "ch",
-    challenge_nonce: "A".repeat(43) + "=",
+    challenge_proof: "A".repeat(43) + "=",
   };
 
   it("fetches the group's rotation material with a bearer-authenticated GET", async () => {

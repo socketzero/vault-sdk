@@ -18,15 +18,20 @@
  *   - fetch-group mints a single-use challenge: 32 random bytes sealed to the
  *     group's current public half under
  *     `bucketAssociatedData(group id, "rotation-challenge:" + id)`. The commit
- *     must carry `challenge_id` and `challenge_nonce` (base64 of the opened
- *     bytes): absent is `403 proof required`; wrong, another group's, expired
+ *     must carry `challenge_id` and `challenge_proof` — HMAC-SHA256 keyed by
+ *     the nonce over "socket0/rotation-proof/v1" 0x00 group id 0x00 and the
+ *     body without the proof, keys sorted — so a proof answers for one body
+ *     only: absent is `403 proof required`; wrong (for that body), another
+ *     group's, expired
  *     (`expires_at`, 300 s after minting on `now`, is exclusive), or an
  *     earlier generation's sent with a generation other than its own is
  *     `403 proof invalid`; spent is `409 stale`. A landed commit spends it.
  *
- * The only cryptography here is that `seal`, which needs no secret. The server
- * cannot open anything, and neither can this fake: whether the SDK resealed
- * correctly is for the test to prove by opening what was stored.
+ * The only cryptography here is that `seal`, which needs no secret, and the
+ * proof's HMAC, keyed by a nonce the server minted. The server cannot open
+ * anything, and neither can this fake: whether the SDK resealed correctly is
+ * for the test to prove by opening what was stored. The canonical form is
+ * written here independently of the SDK's, so the two must agree to pass.
  */
 
 import { base64Decode, base64Encode } from "./encoding.js";
@@ -167,7 +172,7 @@ export function fakeRotationApi(state: FakeState): FakeRotationApi {
     const group = state.groups.find((g) => g.id === groupId && g.tenantId === tenantId);
     if (group === undefined) return [404, NOT_FOUND];
     if (method === "GET") return [200, await material(group)];
-    if (method === "POST") return commit(group, body);
+    if (method === "POST") return await commit(group, body);
     return [405, { error: "method not allowed" }];
   }
 
@@ -225,19 +230,19 @@ export function fakeRotationApi(state: FakeState): FakeRotationApi {
     };
   }
 
-  function commit(group: FakeGroup, raw: unknown): [number, unknown] {
+  async function commit(group: FakeGroup, raw: unknown): Promise<[number, unknown]> {
     const body = parseCommit(raw);
     if (body === undefined) return [400, INVALID];
     api.beforeCommit?.();
 
-    if (body.challenge_id === undefined || body.challenge_nonce === undefined) {
+    if (body.challenge_id === undefined || body.challenge_proof === undefined) {
       return [403, { error: "proof required" }];
     }
     const challenge = api.challenges.get(body.challenge_id);
     if (
       challenge === undefined ||
       challenge.groupId !== group.id ||
-      challenge.nonce !== body.challenge_nonce
+      (await expectedProof(challenge.nonce, group.id, raw)) !== body.challenge_proof
     ) {
       return [403, { error: "proof invalid" }];
     }
@@ -360,7 +365,28 @@ interface SentCommit {
   recovery_public_key?: string;
   recovery_entry?: string;
   challenge_id?: string;
-  challenge_nonce?: string;
+  challenge_proof?: string;
+}
+
+/** What `challenge_proof` must be for this body: keys sorted by a replacer, then HMAC. */
+async function expectedProof(nonce: string, groupId: string, raw: unknown): Promise<string> {
+  const { challenge_proof: _, ...rest } = raw as Record<string, unknown>;
+  const sorted = JSON.stringify(rest, (_k, v: unknown) =>
+    isRecord(v) ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => (a < b ? -1 : 1))) : v,
+  );
+  const key = await globalThis.crypto.subtle.importKey(
+    "raw",
+    base64Decode(nonce),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const mac = await globalThis.crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(`socket0/rotation-proof/v1\0${groupId}\0${sorted}`),
+  );
+  return base64Encode(new Uint8Array(mac));
 }
 
 const isRecord = (v: unknown): v is Record<string, unknown> =>
@@ -383,10 +409,10 @@ function parseCommit(raw: unknown): SentCommit | undefined {
       "recovery_public_key",
       "recovery_entry",
       "challenge_id",
-      "challenge_nonce",
+      "challenge_proof",
     ]) ||
     (raw["challenge_id"] !== undefined && typeof raw["challenge_id"] !== "string") ||
-    (raw["challenge_nonce"] !== undefined && typeof raw["challenge_nonce"] !== "string") ||
+    (raw["challenge_proof"] !== undefined && typeof raw["challenge_proof"] !== "string") ||
     !isInt(raw["expected_generation"], 0) ||
     typeof raw["public_key"] !== "string" ||
     !PUBLIC_KEY.test(raw["public_key"]) ||
