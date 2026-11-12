@@ -189,9 +189,30 @@ export { openRecovery, sealRecovery } from "./recovery.js";
 export type { HttpKeyGroupRegistrarOptions } from "./registrar-http.js";
 export {
   httpKeyGroupRegistrar,
+  httpKeyGroupRotator,
   KeyGroupRegistrarError,
   KeyGroupRegistrarResponseError,
 } from "./registrar-http.js";
+// --- remove-key (protocol/tenant-management, remove-key) ---------------------
+//
+// rotateGroup run end to end: refuse the last key, fetch-group, unwrap with a
+// surviving key, rotate (with K0 when the group has one), commit-rotation.
+// Rotation runs on the tenant's machine (socketzero/solution#28); the two
+// routes go through a `KeyGroupRotator` the caller passes in.
+export type {
+  CommitRotationRequest,
+  KeyGroupRotator,
+  KeyRemovalRefusal,
+  RemovedKey,
+  RemoveKeyOptions,
+  RotationMaterial,
+} from "./remove-key.js";
+export {
+  KeyRemovalOutcomeUnknownError,
+  KeyRemovalRefusedError,
+  removeKey,
+  rotationProof,
+} from "./remove-key.js";
 // --- branded key material: the only way to make a key out of bytes ---------
 //
 // A public half, a private half and an API key are all 32 raw bytes and all
