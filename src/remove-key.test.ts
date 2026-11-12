@@ -694,6 +694,32 @@ describe("removeKey", () => {
       expect(w.group.generation).toBe(4);
     });
 
+    it("gets the API's 403 for a challenge that expired before the commit, and does not retry", async () => {
+      const w = await world(2, false);
+      // A reseal slower than the challenge's 300 s life.
+      w.api.beforeCommit = () => {
+        w.api.now += 300;
+      };
+      const err = await run(w);
+      expect(err).toBeInstanceOf(KeyGroupRegistrarError);
+      expect((err as KeyGroupRegistrarError).status).toBe(403);
+      expect((err as KeyGroupRegistrarError).apiError).toBe("proof invalid");
+      expect(w.api.calls.map((x) => [x.method, x.status])).toEqual([
+        ["GET", 200],
+        ["POST", 403],
+      ]);
+      expect(w.group.generation).toBe(4);
+    });
+
+    it("lands with a challenge one second short of expiry", async () => {
+      const w = await world(2, false);
+      w.api.beforeCommit = () => {
+        w.api.now += 299;
+      };
+      await expect(run(w)).resolves.toMatchObject({ removedKeyId: w.keyIds[1] });
+      expect(w.group.generation).toBe(5);
+    });
+
     it.each([
       [
         "sealed to a key other than the group's",

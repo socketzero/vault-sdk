@@ -19,7 +19,8 @@
  *     group's current public half under
  *     `bucketAssociatedData(group id, "rotation-challenge:" + id)`. The commit
  *     must carry `challenge_id` and `challenge_nonce` (base64 of the opened
- *     bytes): absent is `403 proof required`; wrong, another group's, or an
+ *     bytes): absent is `403 proof required`; wrong, another group's, expired
+ *     (`expires_at`, 300 s after minting on `now`, is exclusive), or an
  *     earlier generation's sent with a generation other than its own is
  *     `403 proof invalid`; spent is `409 stale`. A landed commit spends it.
  *
@@ -95,6 +96,8 @@ export interface FakeRotationApi {
   beforeCommit: (() => void) | undefined;
   /** Every challenge minted, by id: the nonce as base64, and whether it was spent. */
   readonly challenges: Map<string, FakeChallenge>;
+  /** The server's clock, unix seconds: what a challenge's expiry is judged on. */
+  now: number;
   /**
    * Replaces the challenge fetch-group would send — where a server that lies
    * about it goes. Receives the honest one, already stored.
@@ -108,6 +111,7 @@ export interface FakeChallenge {
   readonly groupId: string;
   readonly generation: number;
   readonly nonce: string;
+  readonly expiresAt: number;
   spent: boolean;
 }
 
@@ -118,6 +122,8 @@ export interface SentChallenge {
 }
 
 const NOT_FOUND = { error: "not found" };
+/** socket0-api's challenge life, seconds. */
+const CHALLENGE_TTL = 300;
 const INVALID = { error: "invalid request" };
 
 export function fakeRotationApi(state: FakeState): FakeRotationApi {
@@ -128,6 +134,7 @@ export function fakeRotationApi(state: FakeState): FakeRotationApi {
     calls,
     beforeCommit: undefined,
     challenges: new Map(),
+    now: 1_800_000_000,
     tamperChallenge: undefined,
     fetch: (async (input: string | URL | Request, init?: RequestInit) => {
       init?.signal?.throwIfAborted();
@@ -181,10 +188,12 @@ export function fakeRotationApi(state: FakeState): FakeRotationApi {
     minted += 1;
     const id = `0192f1a0-cccc-7000-8000-${minted.toString(16).padStart(12, "0")}`;
     const nonce = globalThis.crypto.getRandomValues(new Uint8Array(32));
+    const expiresAt = api.now + CHALLENGE_TTL;
     api.challenges.set(id, {
       groupId: group.id,
       generation: group.generation,
       nonce: base64Encode(nonce),
+      expiresAt,
       spent: false,
     });
     const honest = {
@@ -194,7 +203,7 @@ export function fakeRotationApi(state: FakeState): FakeRotationApi {
         asPublicKey(base64Decode(group.publicKey)),
         bucketAssociatedData(group.id, `rotation-challenge:${id}`),
       ),
-      expires_at: 2_000_000_000,
+      expires_at: expiresAt,
     };
     return api.tamperChallenge === undefined ? honest : api.tamperChallenge(honest, group);
   }
@@ -233,6 +242,7 @@ export function fakeRotationApi(state: FakeState): FakeRotationApi {
       return [403, { error: "proof invalid" }];
     }
     if (challenge.spent) return [409, { error: "stale" }];
+    if (challenge.expiresAt <= api.now) return [403, { error: "proof invalid" }];
     // Another generation's challenge is a lost race when sent with its own
     // generation (409 stale below), and no proof otherwise.
     if (
