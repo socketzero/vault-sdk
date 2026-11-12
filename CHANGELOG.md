@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.0](https://github.com/socketzero/vault-sdk/compare/v0.5.0...v0.6.0) (2026-11-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* **remove-key:** CommitRotationRequest.challenge_nonce is replaced by challenge_proof; socket0-api#42 must verify the HMAC instead of comparing the nonce digest.
+
+### Features
+
+* **remove-key:** removeKey orchestration over rotateGroup ([#11](https://github.com/socketzero/vault-sdk/issues/11)) ([0b50a0d](https://github.com/socketzero/vault-sdk/commit/0b50a0d8d96f4e4fae7a03405104f92094879509))
+
 ## [0.5.0](https://github.com/socketzero/vault-sdk/compare/v0.4.0...v0.5.0) (2026-11-11)
 
 
