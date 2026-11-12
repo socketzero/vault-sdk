@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { RegisteredKeyGroup, RegisterKeyGroupRequest } from "./bootstrap.js";
 import {
   httpKeyGroupRegistrar,
+  httpKeyGroupRotator,
   KeyGroupRegistrarError,
   KeyGroupRegistrarResponseError,
 } from "./registrar-http.js";
@@ -254,5 +255,108 @@ describe("httpKeyGroupRegistrar", () => {
     await registrar.registerKeyGroup(TENANT, BODY);
     expect(seen[0]?.init?.signal).toBe(controller.signal);
     expect(seen[1]?.init !== undefined && "signal" in seen[1].init).toBe(false);
+  });
+});
+
+describe("httpKeyGroupRotator", () => {
+  const GROUP_ID = GROUP.id;
+  const MATERIAL = {
+    id: GROUP_ID,
+    generation: 2,
+    public_key: GROUP.public_key,
+    recovery_public_key: null,
+    keys: [{ key_id: "0".repeat(32), wrapped: "B".repeat(80), label: null, created_at: 1 }],
+    connections: [{ id: "c", version: 1, sealed: { password: "x25519-hkdf-aesgcm:AAAA" } }],
+    auth_apps: [{ id: "a", sealed_client_secret: "x25519-hkdf-aesgcm:AAAA" }],
+  };
+  const COMMIT = {
+    expected_generation: 2,
+    public_key: GROUP.public_key,
+    keys: [{ key_id: "0".repeat(32), wrapped: "B".repeat(80) }],
+    connections: [],
+    auth_apps: [],
+  };
+
+  it("fetches the group's rotation material with a bearer-authenticated GET", async () => {
+    const { fetch, seen } = fakeFetch(200, MATERIAL);
+    const rotator = httpKeyGroupRotator({
+      baseUrl: "https://api.example/v1",
+      accessToken: "tok",
+      fetch,
+    });
+    expect(await rotator.fetchRotation(TENANT, GROUP_ID)).toEqual(MATERIAL);
+    expect(seen[0]?.url).toBe(
+      `https://api.example/v1/tenants/${TENANT}/key-groups/${GROUP_ID}/rotation`,
+    );
+    expect(seen[0]?.init?.method).toBe("GET");
+    expect(seen[0]?.init?.body).toBeUndefined();
+    expect(new Headers(seen[0]?.init?.headers).get("authorization")).toBe("Bearer tok");
+  });
+
+  it("commits with a JSON POST and returns the rotated group", async () => {
+    const { fetch, seen } = fakeFetch(200, { ...GROUP, generation: 3 });
+    const rotator = httpKeyGroupRotator({
+      baseUrl: "https://api.example/v1",
+      accessToken: "tok",
+      fetch,
+    });
+    const controller = new AbortController();
+    expect(
+      (await rotator.commitRotation(TENANT, GROUP_ID, COMMIT, controller.signal)).generation,
+    ).toBe(3);
+    expect(seen[0]?.init?.method).toBe("POST");
+    expect(JSON.parse(seen[0]?.init?.body as string)).toEqual(COMMIT);
+    expect(seen[0]?.init?.signal).toBe(controller.signal);
+  });
+
+  it("surfaces a 409's reason on the error", async () => {
+    const { fetch } = fakeFetch(409, { error: "stale" });
+    const rotator = httpKeyGroupRotator({
+      baseUrl: "https://api.example/v1",
+      accessToken: "tok",
+      fetch,
+    });
+    const err = await rotator.commitRotation(TENANT, GROUP_ID, COMMIT).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(KeyGroupRegistrarError);
+    expect((err as KeyGroupRegistrarError).status).toBe(409);
+    expect((err as KeyGroupRegistrarError).apiError).toBe("stale");
+  });
+
+  it.each([
+    ["not an object", []],
+    ["a missing generation", { ...MATERIAL, generation: undefined }],
+    ["a numeric recovery key", { ...MATERIAL, recovery_public_key: 1 }],
+    ["keys that are not an array", { ...MATERIAL, keys: {} }],
+    ["a key without created_at", { ...MATERIAL, keys: [{ ...MATERIAL.keys[0], created_at: "1" }] }],
+    ["a key with a numeric label", { ...MATERIAL, keys: [{ ...MATERIAL.keys[0], label: 1 }] }],
+    [
+      "a connection with a non-string seal",
+      { ...MATERIAL, connections: [{ id: "c", version: 1, sealed: { p: 1 } }] },
+    ],
+    ["a connection without sealed", { ...MATERIAL, connections: [{ id: "c", version: 1 }] }],
+    ["an app that is not an object", { ...MATERIAL, auth_apps: ["a"] }],
+    ["an app without its copy", { ...MATERIAL, auth_apps: [{ id: "a" }] }],
+  ])("refuses fetched material with %s", async (_what, body) => {
+    const { fetch } = fakeFetch(200, body);
+    const rotator = httpKeyGroupRotator({
+      baseUrl: "https://api.example/v1",
+      accessToken: "tok",
+      fetch,
+    });
+    await expect(rotator.fetchRotation(TENANT, GROUP_ID)).rejects.toBeInstanceOf(
+      KeyGroupRegistrarResponseError,
+    );
+  });
+
+  it("refuses a 200 commit whose body is not a KeyGroup", async () => {
+    const { fetch } = fakeFetch(200, { ok: true });
+    const rotator = httpKeyGroupRotator({
+      baseUrl: "https://api.example/v1",
+      accessToken: "tok",
+      fetch,
+    });
+    await expect(rotator.commitRotation(TENANT, GROUP_ID, COMMIT)).rejects.toBeInstanceOf(
+      KeyGroupRegistrarResponseError,
+    );
   });
 });
